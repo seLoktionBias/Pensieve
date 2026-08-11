@@ -597,9 +597,3 @@ The v3.31 smoke suite includes synthetic tests for:
 - sticky pseudogenic history after an apparent compensatory restoration.
 
 See `VALIDATION.md` for the exact boundary between tested orchestration/logic and external-program validation.
-
-## Scope
-
-Pensieve organises molecular evidence for candidate gene loss; it does not prove complete biological loss of every isoform/function. Assembly error, alternative transcripts, gene conversion, compensatory evolution and alignment uncertainty still require biological review.
-
-Branch-specific free-ratio omega and Meredith-style within-branch timing are **not part of v3.31's core implementation**. They should be treated as an optional downstream analysis only after the pseudogenization branch is established robustly.
