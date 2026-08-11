@@ -1,0 +1,988 @@
+#!/usr/bin/env python3
+"""Pensieve v3.31 smoke/logic tests that do not require real external programs.
+
+These tests are intentionally targeted at the failure modes discussed during
+v3.25 review: canonical alignment preparation, breakpoint decomposition,
+parsimony ties, STOP retention, runner orchestration and lesion-aware ORF
+history. They do not claim biological validation of MACSE/PAML/IndelMaP.
+"""
+from __future__ import annotations
+
+import csv
+import importlib.util
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+FAILURES: list[str] = []
+
+
+def check(condition, message):
+    if not condition:
+        FAILURES.append(message)
+        print(f"  FAIL {message}")
+    else:
+        print(f"  ok   {message}")
+
+
+def load(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def tsv(path):
+    with open(path) as handle:
+        return list(csv.DictReader(handle, delimiter="\t"))
+
+
+def fasta(path):
+    out = {}
+    name = None
+    chunks = []
+    for line in Path(path).read_text().splitlines():
+        if line.startswith(">"):
+            if name is not None:
+                out[name] = "".join(chunks)
+            name = line[1:].split()[0]
+            chunks = []
+        elif line.strip():
+            chunks.append(line.strip())
+    if name is not None:
+        out[name] = "".join(chunks)
+    return out
+
+
+def fasta_order(path):
+    return [line[1:].split()[0] for line in Path(path).read_text().splitlines() if line.startswith(">") ]
+
+
+def write_table(path, header, rows):
+    with open(path, "w", newline="") as handle:
+        w = csv.DictWriter(handle, fieldnames=header, delimiter="\t")
+        w.writeheader(); w.writerows(rows)
+
+
+def test_static_and_cli():
+    print("static architecture and CLI")
+    check((ROOT / "VERSION").read_text().strip() == "3.36", "VERSION is 3.36")
+    ctl = (ROOT / "templates" / "dummy_codon_asr.ctl").read_text()
+    for token, msg in [
+        ("clock = 0", "codeml clock=0"),
+        ("fix_blength = 0", "codeml estimates its own branch lengths"),
+        ("cleandata = 0", "codeml retains ambiguous sites"),
+        ("RateAncestor = 1", "codeml marginal ancestral reconstruction enabled"),
+    ]:
+        check(token in ctl, msg)
+
+    runner = (ROOT / "scripts" / "run_one_gene_00_to_04.sh").read_text()
+    prep_pos = runner.find('02_prepare_asr_inputs.py')
+    events_pos = runner.find('03_alignment_events.py')
+    backend_pos = runner.find('02_run_asr_backends.sh')
+    integrate_pos = runner.find('03_integrate_asr_evidence.py')
+    check(-1 not in {prep_pos, events_pos, backend_pos, integrate_pos}, "all core stages are invoked by runner")
+    check(prep_pos < events_pos < backend_pos < integrate_pos,
+          "runner order is alignment -> events -> ASR -> integration")
+    check('candidate_indel_frameshift_events.tsv' not in runner,
+          "runner no longer depends on legacy candidate-event files")
+    check('paml_indelmap_asr_combined' not in runner,
+          "runner no longer uses IndelMaP-projected authoritative ancestors")
+    integrator = (ROOT / "scripts" / "03_integrate_asr_evidence.py").read_text()
+    for obsolete in ["build_orf_table", "project_indelmap_gaps_onto_paml", "load_user_internode_registry",
+                     "build_tripartition_registry", "validate_unrooted_and_rooted_tree_audit"]:
+        check(f"def {obsolete}" not in integrator, f"dead legacy integration helper removed: {obsolete}")
+    check("Nodes X to Y are ancestral" in integrator and "tip_count - 2" not in integrator,
+          "PAML ASR completeness is driven by rst declaration, not n-2 guesswork")
+    for opt in ['--indelmap', '--tie-break', '--breakpoint-tolerance']:
+        check(opt in (ROOT / "bin" / "pensieve").read_text(), f"top-level CLI forwards {opt}")
+
+    for args in [["-h"], ["-help"], ["--help"], ["--help", "-long"]]:
+        r = subprocess.run([sys.executable, str(ROOT / "bin" / "pensieve"), *args], capture_output=True, text=True)
+        check(r.returncode == 0 and "Pensieve" in r.stdout, f"help form {' '.join(args)} works")
+    long_help = subprocess.run([sys.executable, str(ROOT / "bin" / "pensieve"), "--help", "-long"],
+                               capture_output=True, text=True).stdout
+    check("Pensieve v3.36 - full manual" in long_help, "long help reports v3.36")
+    check("diagnostics < alignment < events < asr < integrate < plot" in long_help,
+          "long help documents actual stage order")
+
+
+def test_breakpoint_decomposition():
+    print("breakpoint decomposition")
+    mod = load("03_alignment_events")
+    intervals = [(646, 687), (646, 696), (661, 669)]
+    check(mod.decompose_run((646, 696), intervals, 0) == [(646, 687), (688, 696)],
+          "GUCA1B-style long run decomposes into shared core plus extension")
+    check(mod.decompose_run((646, 687), intervals, 0) == [(646, 687)],
+          "independent interior run does not split the shared Miniopterus core")
+    check(mod.gap_runs("AA---AA-A") == [(3, 5), (8, 8)], "maximal gap runs are detected")
+
+
+def run_event_case(tmp: Path, tree_text: str, seqs: dict[str, str], masked_rows=None, gene="T"):
+    tree = tmp / "tree.nwk"; tree.write_text(tree_text + ("\n" if not tree_text.endswith("\n") else ""))
+    aln = tmp / "aln.fa"; aln.write_text("".join(f">{k}\n{v}\n" for k, v in seqs.items()))
+    out = tmp / "events"
+    cmd = [sys.executable, str(ROOT / "scripts" / "03_alignment_events.py"),
+           "--gene", gene, "--alignment", str(aln), "--tree", str(tree),
+           "--outdir", str(out), "--dated", "yes", "--tie-break", "none"]
+    if masked_rows is not None:
+        m = tmp / "stops.tsv"
+        header = ["gene", "species", "primary_alignment_start", "primary_alignment_end", "stop_codon",
+                  "pseudogenizing_event_candidate", "independent_stop_candidate"]
+        write_table(m, header, masked_rows)
+        cmd += ["--masked-stops", str(m)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    check(r.returncode == 0, f"event engine runs ({r.stderr[:120]})")
+    return out
+
+
+
+def test_guca1b_breakpoint_history_end_to_end():
+    print("GUCA1B shared-core/extension/interior history")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td); length = 720; base = list("A" * length)
+        def seq(gaps):
+            x = base.copy()
+            for start, end in gaps:
+                for i in range(start - 1, end):
+                    x[i] = "-"
+            return "".join(x)
+        seqs = {
+            "Miniopterus_australis": seq([(646, 696)]),
+            "Miniopterus_natalensis": seq([(646, 687)]),
+            "Miniopterus_schreibersii": seq([(646, 687)]),
+            "Nycteris_thebaica": seq([(661, 669)]),
+            "Out1": seq([]),
+            "Out2": seq([]),
+        }
+        tree = ("((((Miniopterus_australis:1,Miniopterus_natalensis:1):0.2,"
+                "Miniopterus_schreibersii:1.2):1,Nycteris_thebaica:2.2):1,"
+                "(Out1:1,Out2:1):2.2);")
+        out = run_event_case(tmp, tree, seqs, gene="GUCA1B")
+        rows = tsv(out / "03_GUCA1B.alignment_events.tsv")
+        by_span = {(int(r["alignment_start"]), int(r["alignment_end"])): r for r in rows}
+        shared = by_span.get((646, 687))
+        ext = by_span.get((688, 696))
+        nyc = by_span.get((661, 669))
+        check(shared is not None and shared["biological_interpretation"] == "deletion"
+              and shared["shared_event"] == "True" and shared["ambiguous_origin"] == "False",
+              "646-687 is one confident shared Miniopterus deletion")
+        check(shared is not None and set(shared["affected_tips"].split(",")) == {
+              "Miniopterus_australis", "Miniopterus_natalensis", "Miniopterus_schreibersii"},
+              "shared core affects exactly the three Miniopterus tips")
+        check(ext is not None and ext["biological_interpretation"] == "deletion"
+              and ext["origin_is_tip"] == "True" and ext["affected_tips"] == "Miniopterus_australis",
+              "688-696 remains an australis-specific extension")
+        check(nyc is not None and nyc["origin_is_tip"] == "True" and nyc["affected_tips"] == "Nycteris_thebaica",
+              "661-669 remains an independent Nycteris event rather than splitting the Miniopterus core")
+
+def test_parsimony_tie_and_direction():
+    print("parsimony ties and insertion/deletion direction")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        # 2-of-4 monophyletic gap state has two equally parsimonious polarities:
+        # deletion on AB OR ancestral gap plus insertion on CD. It must stay ambiguous.
+        seqs = {"A":"ATG---CCCGGG", "B":"ATG---CCCGGG",
+                "C":"ATGAAACCCGGG", "D":"ATGAAACCCGGG"}
+        out = run_event_case(tmp, "((A:1,B:1):1,(C:1,D:1):1);", seqs)
+        rows = tsv(out / "03_T.alignment_events.tsv")
+        check(rows, "tie case emits representative event rows")
+        check(all(r["direction_confident"] == "False" for r in rows),
+              "exact root-polarity tie never becomes direction-confident")
+        check(all(r["ambiguous_origin"] == "True" for r in rows),
+              "exact root-polarity tie is explicitly flagged")
+        check(all(r["biological_interpretation"] == "ambiguous_indel_change" for r in rows),
+              "tie is not mislabeled as a definitive deletion")
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        # Three non-monophyletic gap carriers vs one residue tip strongly favors
+        # ancestral GAP and a residue gain on D: an insertion/restoration, proving
+        # native gap coding does not equate MACSE-style missing placeholders with deletion.
+        seqs = {"A":"ATG--ACCCGGG", "B":"ATG--ACCCGGG",
+                "C":"ATG--ACCCGGG", "D":"ATG-AA CCCGGG".replace(" ", "")}
+        # At column 5: A/B/C have '-', D has 'A'; column 4 is gap in all tips.
+        out = run_event_case(tmp, "((A:1,C:1):1,(B:1,D:1):1);", seqs)
+        rows = tsv(out / "03_T.alignment_events.tsv")
+        ins = [r for r in rows if r["biological_interpretation"] == "insertion_or_restoration"
+               and r["direction_confident"] == "True"]
+        check(bool(ins), "gap/residue context can reconstruct a confident insertion/residue gain")
+
+
+def test_stop_alleles_are_separate():
+    print("premature STOP event identity")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        seqs = {"A":"ATGAAATGACCC", "B":"ATGAAATAACCC",
+                "C":"ATGAAACCCCCC", "D":"ATGAAACCCCCC"}
+        masked = [
+            {"gene":"T","species":"A","primary_alignment_start":7,"primary_alignment_end":9,
+             "stop_codon":"TGA","pseudogenizing_event_candidate":True,"independent_stop_candidate":True},
+            {"gene":"T","species":"B","primary_alignment_start":7,"primary_alignment_end":9,
+             "stop_codon":"TAA","pseudogenizing_event_candidate":True,"independent_stop_candidate":True},
+        ]
+        out = run_event_case(tmp, "((A:1,B:1):1,(C:1,D:1):1);", seqs, masked)
+        chars = tsv(out / "03_T.alignment_characters.tsv")
+        stops = sorted(r["stop_codon"] for r in chars if r["character_class"] == "stop_mask")
+        check(stops == ["TAA", "TGA"], "TAA and TGA at the same codon are separate event characters")
+
+
+def test_shared_stop_not_missed_when_only_one_tip_is_registered():
+    # Real bug found on a genuine HPC run (PDE6H): two sister tips (A, B) carry
+    # the exact same premature-stop allele at the exact same canonical
+    # alignment columns. Only A's occurrence was classified by the upstream
+    # raw-sequence scan as an "independent_stop_candidate" (pseudogenizing_
+    # event_candidate=True); B's occurrence fell through to a generic
+    # catch-all classification (pseudogenizing_event_candidate=False) even
+    # though B's canonical-alignment segment at those exact columns is the
+    # identical stop codon. Before the fix, stop_mask_characters() only ever
+    # marked a tip PRESENT via that per-species classification gate, so B was
+    # silently treated as ABSENT despite unambiguously carrying the stop in
+    # the canonical alignment -- corrupting the shared-ancestry reconstruction
+    # (the true shared internal-branch origin was reported as two independent
+    # tip-only gains, with no event ever attributed to the shared ancestor).
+    print("shared STOP allele is not missed when only one carrier was classified as independent")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        seqs = {"A": "ATGAAATGACCC", "B": "ATGAAATGACCC",
+                "C": "ATGAAACCCCCC", "D": "ATGAAACCCCCC"}
+        masked = [
+            {"gene": "T", "species": "A", "primary_alignment_start": 7, "primary_alignment_end": 9,
+             "stop_codon": "TGA", "pseudogenizing_event_candidate": True, "independent_stop_candidate": True},
+            {"gene": "T", "species": "B", "primary_alignment_start": 7, "primary_alignment_end": 9,
+             "stop_codon": "TGA", "pseudogenizing_event_candidate": False, "independent_stop_candidate": False},
+        ]
+        out = run_event_case(tmp, "((A:1,B:1):1,(C:1,D:1):1);", seqs, masked)
+        chars = tsv(out / "03_T.alignment_characters.tsv")
+        stop_chars = [r for r in chars if r["character_class"] == "stop_mask"]
+        check(len(stop_chars) == 1 and stop_chars[0]["n_observed_present"] == "2",
+              f"both A and B are observed present for the shared STOP character ({stop_chars})")
+        states = tsv(out / "03_T.alignment_character_node_states.tsv")
+        b_state = next((r for r in states if r["character_id"] == "STOP0001" and r["node_label"] == "B"), None)
+        check(b_state is not None and b_state["representative_state"] == "present",
+              f"the unregistered-but-identical carrier B is reconstructed as present, not absent ({b_state})")
+        events = tsv(out / "03_T.alignment_events.tsv")
+        stop_events = [r for r in events if r["character_class"] == "stop_mask"]
+        check(len(stop_events) == 1, f"one shared STOP event, not two independent ones ({stop_events})")
+        ev = stop_events[0]
+        check(ev["shared_event"] == "True" and ev["origin_is_tip"] == "False"
+              and set(ev["affected_tips"].split(",")) == {"A", "B"},
+              f"the STOP event is correctly attributed to the shared ancestor of A and B ({ev})")
+
+
+def test_compensated_frameshift_stop_classification():
+    print("STOP classification after compensated MACSE frame shifts")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td); r0 = tmp/"r0"; r1 = tmp/"r1"; r2 = tmp/"r2"
+        r0.mkdir(); r1.mkdir(); r2.mkdir()
+        raw_a = "ATGAAACCCTGAGGGCCC"  # premature TGA at raw nt 10-12
+        raw_b = "ATGAAACCCCCCGGGCCC"
+        (r0/"00_T.common_species.gapless_for_macse.fasta").write_text(f">A\n{raw_a}\n>B\n{raw_b}\n")
+        (r0/"00_T.common_species.fasta").write_text(f">A\n{raw_a}\n>B\n{raw_b}\n")
+        (r0/"00_T.common_species.tree").write_text("(A:1,B:1);\n")
+        write_table(r0/"00_T.orf_status.tsv", ["species","premature_stop_count","complete_orf"], [
+            {"species":"A","premature_stop_count":1,"complete_orf":False},
+            {"species":"B","premature_stop_count":0,"complete_orf":True},
+        ])
+        write_table(r0/"00_T.orf_failures.tsv",
+                    ["gene","species","failure_type","codon_position","nt_start","nt_end","codon","details"], [
+            {"gene":"T","species":"A","failure_type":"premature_in_frame_stop","codon_position":4,
+             "nt_start":10,"nt_end":12,"codon":"TGA","details":"raw_unaligned_sequence"},
+        ])
+        # Two upstream MACSE partial-codon runs have lengths 1 and 2. Their
+        # cumulative frame correction is 3 mod 3 = 0, so the STOP is back in
+        # phase and must remain an independent nonsense candidate.
+        macse_a = "ATG!AAA!!CCCTGAGGGCCC"
+        macse_b = "ATG-AAA--CCCCCCGGGCCC"
+        (r1/"01_T.macse_NT.fasta").write_text(f">A\n{macse_a}\n>B\n{macse_b}\n")
+        (r1/"01_T.macse_AA.fasta").write_text(">A\nXXXXXXX\n>B\nXXXXXXX\n")
+        r = subprocess.run([sys.executable, str(ROOT/"scripts"/"01_run_macse_and_extract_events.py"),
+                            "--gene","T","--step00-dir",str(r0),"--outdir",str(r1)],
+                           capture_output=True,text=True)
+        check(r.returncode==0, f"step01 compensated-frame diagnostic runs ({r.stderr[:160]})")
+        diag = tsv(r1/"01_T.macse_premature_stop_masking.tsv")
+        a = [x for x in diag if x["species"]=="A"]
+        check(a and a[0]["upstream_macse_marker_count"]=="2"
+              and a[0]["upstream_macse_frame_correction_mod3"]=="0"
+              and a[0]["frame_shifted_at_stop"]=="False",
+              "two upstream MACSE corrections summing to 0 mod 3 restore frame at the STOP")
+        check(a and "independent_candidate_after_compensated_frame_restoration" in a[0]["interpretation"],
+              "restored-frame STOP is not mislabeled as a frameshift consequence")
+
+        r = subprocess.run([sys.executable, str(ROOT/"scripts"/"02_prepare_asr_inputs.py"),
+                            "--gene","T","--results01-dir",str(r1),"--results00-dir",str(r0),
+                            "--outdir",str(r2),"--alignment-mode","perform"],capture_output=True,text=True)
+        check(r.returncode==0, f"step02 accepts compensated-frame STOP ({r.stderr[:160]})")
+        reg = tsv(r2/"02_T.masked_inframe_premature_stops_after_macse_correction.tsv")
+        a2 = [x for x in reg if x["species"]=="A" and x["stop_codon"]=="TGA"]
+        check(a2 and a2[0]["independent_stop_candidate"]=="True"
+              and a2[0]["pseudogenizing_event_candidate"]=="True",
+              "genuine STOP downstream of compensated frameshifts remains in the event catalogue")
+
+
+def make_step_dirs(tmp: Path, gene="T"):
+    r0 = tmp / "r0"; r1 = tmp / "r1"; r2 = tmp / "r2"
+    r0.mkdir(); r1.mkdir(); r2.mkdir()
+    (r0 / f"00_{gene}.common_species.tree").write_text("((A:1,B:1):1,(C:1,D:1):1);\n")
+    return r0, r1, r2
+
+
+def test_canonical_alignment_prepare():
+    print("canonical alignment preparation")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td); r0, r1, r2 = make_step_dirs(tmp)
+        user = {"A":"ATGAAATAACCC", "B":"ATGAAACCCCC", "C":"ATGAAACCCCCC", "D":"ATGAAACCCCCC"}
+        # B is intentionally length 11 in the raw sequence: no premature STOP gate
+        # should stop MACSE's frameshift-aware representation from being used.
+        (r0 / "00_T.common_species.fasta").write_text("".join(f">{k}\n{v}\n" for k,v in user.items()))
+        write_table(r0 / "00_T.orf_failures.tsv",
+                    ["gene","species","failure_type","codon_position","nt_start","nt_end","codon","details"],
+                    [{"gene":"T","species":"A","failure_type":"premature_in_frame_stop","codon_position":3,
+                      "nt_start":7,"nt_end":9,"codon":"TAA","details":"raw_unaligned_sequence"},
+                     {"gene":"T","species":"B","failure_type":"length_not_multiple_of_3","codon_position":"NA",
+                      "nt_start":"NA","nt_end":"NA","codon":"NA","details":"length=11"}])
+        macse = {"A":"ATGAAATAACCC", "B":"ATGAAA!CCCCC", "C":"ATGAAACCCCCC", "D":"ATGAAACCCCCC"}
+        (r1 / "01_T.macse_NT.fasta").write_text("".join(f">{k}\n{v}\n" for k,v in macse.items()))
+        write_table(r1 / "01_T.macse_premature_stop_masking.tsv",
+                    ["species","raw_nt_start","raw_nt_end","masked_by_upstream_macse_frameshift_marker"],
+                    [{"species":"A","raw_nt_start":7,"raw_nt_end":9,
+                      "masked_by_upstream_macse_frameshift_marker":False}])
+        r = subprocess.run([sys.executable, str(ROOT/"scripts"/"02_prepare_asr_inputs.py"),
+                            "--gene","T","--results01-dir",str(r1),"--results00-dir",str(r0),
+                            "--outdir",str(r2),"--alignment-mode","perform"], capture_output=True, text=True)
+        check(r.returncode == 0, f"perform-mode preparation runs ({r.stderr[:120]})")
+        native = fasta(r2 / "02_T.primary_codon_alignment_native.fasta")
+        safe = fasta(r2 / "02_T.primary_codon_alignment.fasta")
+        check(native["B"][6] == "-" and safe["B"][6] == "N",
+              "frameshift-only taxon is retained through MACSE placeholder conversion without a STOP gate")
+        check(native["A"][6:9] == "TAA" and safe["A"][6:9] == "NNN",
+              "raw premature STOP survives in native coordinates and is masked only in PAML view")
+        stops = tsv(r2 / "02_T.masked_inframe_premature_stops_after_macse_correction.tsv")
+        a = [x for x in stops if x["species"] == "A" and x["stop_codon"] == "TAA"]
+        check(a and a[0]["primary_alignment_start"] == "7" and a[0]["independent_stop_candidate"] == "True",
+              "premature STOP registry has canonical coordinates before masking")
+        check((r2 / "02_T.codon_for_paml.phy").stat().st_size > 0,
+              "PAML PHYLIP input is actually created")
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td); r0, r1, r2 = make_step_dirs(tmp)
+        defined = {"A":"ATGAAA---CCC", "B":"ATGAAATTTCCC", "C":"ATGAAATTTCCC", "D":"ATGAAATTTCCC"}
+        (r0 / "00_T.common_species.fasta").write_text("".join(f">{k}\n{v}\n" for k,v in defined.items()))
+        write_table(r0 / "00_T.orf_failures.tsv",
+                    ["gene","species","failure_type","codon_position","nt_start","nt_end","codon","details"], [])
+        # Deliberately different MACSE alignment. Defined mode must ignore its columns.
+        (r1 / "01_T.macse_NT.fasta").write_text("".join(f">{k}\nATGAAACCCCCC\n" for k in defined))
+        write_table(r1 / "01_T.macse_premature_stop_masking.tsv",
+                    ["species","raw_nt_start","raw_nt_end","masked_by_upstream_macse_frameshift_marker"], [])
+        r = subprocess.run([sys.executable, str(ROOT/"scripts"/"02_prepare_asr_inputs.py"),
+                            "--gene","T","--results01-dir",str(r1),"--results00-dir",str(r0),
+                            "--outdir",str(r2),"--alignment-mode","defined"], capture_output=True, text=True)
+        check(r.returncode == 0, f"defined-mode preparation runs ({r.stderr[:120]})")
+        native = fasta(r2 / "02_T.primary_codon_alignment_native.fasta")
+        check(native == defined, "defined-mode user alignment columns are preserved exactly per sequence")
+        prov = tsv(r2 / "02_T.alignment_provenance.tsv")[0]
+        check(prov["defined_alignment_columns_modified"] == "False" and prov["second_alignment_performed"] == "False",
+              "defined mode records that no column insertion/re-alignment occurred")
+
+
+def test_phylogenetic_sequence_ordering():
+    print("phylogenetic ordering of species and internodes")
+    with tempfile.TemporaryDirectory() as td:
+        tmp=Path(td); r0=tmp/"r0"; r1=tmp/"r1"; r2=tmp/"r2"; r0.mkdir(); r1.mkdir(); r2.mkdir()
+        # Deliberately non-alphabetical left-to-right tree order: C,A,D,B.
+        tree=tmp/"tree.nwk"; tree.write_text("((C:1,A:1):1,(D:1,B:1):1);\n")
+        fa=tmp/"T.fa"; seq="ATGAAACCCGGG"
+        fa.write_text("".join(f">{x}\n{seq}\n" for x in ["A","B","C","D"]))
+        r=subprocess.run([sys.executable,str(ROOT/"scripts"/"00_prune_and_check_orf.py"),"--gene","T",
+                          "--fasta",str(fa),"--tree",str(tree),"--outdir",str(r0)],capture_output=True,text=True)
+        check(r.returncode==0,f"step00 phylogenetic ordering runs ({r.stderr[:120]})")
+        check(fasta_order(r0/"00_T.common_species.fasta")==["C","A","D","B"],
+              "step00 FASTA follows rooted tree tip order rather than alphabet")
+
+        # Pretend MACSE returned alphabetical order; step01 must rewrite its files
+        # to the rooted-tree tip order even when reusing existing MACSE outputs.
+        (r1/"01_T.macse_NT.fasta").write_text("".join(f">{x}\n{seq}\n" for x in ["A","B","C","D"]))
+        (r1/"01_T.macse_AA.fasta").write_text("".join(f">{x}\nXXXX\n" for x in ["A","B","C","D"]))
+        r=subprocess.run([sys.executable,str(ROOT/"scripts"/"01_run_macse_and_extract_events.py"),"--gene","T",
+                          "--step00-dir",str(r0),"--outdir",str(r1)],capture_output=True,text=True)
+        check(r.returncode==0,f"step01 reorders reused MACSE output ({r.stderr[:120]})")
+        check(fasta_order(r1/"01_T.macse_NT.fasta")==["C","A","D","B"],
+              "MACSE NT MSA is rewritten in phylogenetic tip order")
+        check(fasta_order(r1/"01_T.macse_AA.fasta")==["C","A","D","B"],
+              "MACSE AA MSA is rewritten in phylogenetic tip order")
+
+        # Step02 final canonical and PAML-safe alignments must retain same order.
+        write_table(r1/"01_T.macse_premature_stop_masking.tsv",
+                    ["species","raw_nt_start","raw_nt_end","masked_by_upstream_macse_frameshift_marker"],[])
+        r=subprocess.run([sys.executable,str(ROOT/"scripts"/"02_prepare_asr_inputs.py"),"--gene","T",
+                          "--results01-dir",str(r1),"--results00-dir",str(r0),"--outdir",str(r2),
+                          "--alignment-mode","perform"],capture_output=True,text=True)
+        check(r.returncode==0,f"step02 phylogenetic ordering runs ({r.stderr[:120]})")
+        check(fasta_order(r2/"02_T.primary_codon_alignment_native.fasta")==["C","A","D","B"],
+              "canonical alignment is in phylogenetic tip order")
+
+    # Combined tip+internode order: root is unavailable under clock=0, then each
+    # internal ancestor immediately precedes its descendant clade.
+    with tempfile.TemporaryDirectory() as td:
+        tmp=Path(td); out=tmp/"out"; out.mkdir()
+        pens=tmp/"pens.nwk"; pens.write_text("((C:1,A:1)NodeCA:1,(D:1,B:1)NodeDB:1)UserRoot;\n")
+        paml=tmp/"paml.nwk"; paml.write_text("((C:1,A:1)PCA:1,(D:1,B:1)PDB:1)PRoot;\n")
+        asr=tmp/"asr.fa"; asr.write_text(">PCA\nATGAAACCCGGG\n>PDB\nATGAAACCCGGG\n")
+        tips=tmp/"tips.fa"; tips.write_text("".join(f">{x}\nATGAAACCCGGG\n" for x in ["A","B","C","D"]))
+        chars=tmp/"chars.tsv"; write_table(chars,["character_id","character_class","alignment_start","alignment_end","length_mod_3","stop_codon"],[])
+        states=tmp/"states.tsv"; write_table(states,["character_id","node_label","state"],[])
+        events=tmp/"events.tsv"; write_table(events,["event_id","branch","character_class","biological_interpretation","length_mod_3","direction_confident"],[])
+        frame=tmp/"frame.tsv"; write_table(frame,["node_label","frame_currently_shifted","structural_state_ambiguous"],[])
+        r=subprocess.run([sys.executable,str(ROOT/"scripts"/"04_ancestral_orf_walk.py"),"--gene","T",
+                          "--paml-tree",str(paml),"--pensieve-tree",str(pens),"--ancestral-fasta",str(asr),
+                          "--tip-alignment",str(tips),"--character-states",str(states),"--characters",str(chars),
+                          "--events",str(events),"--frame-arithmetic",str(frame),"--outdir",str(out)],
+                         capture_output=True,text=True)
+        check(r.returncode==0,f"combined phylogenetic MSA construction runs ({r.stderr[:120]})")
+        expected=["NodeCA","C","A","NodeDB","D","B"]
+        check(fasta_order(out/"03_T.phylogenetic_msa.fa")==expected,
+              "combined species+internode MSA follows rooted tree preorder")
+        order_rows=tsv(out/"03_T.phylogenetic_sequence_order.tsv")
+        check([x["node_label"] for x in order_rows]==["UserRoot","NodeCA","C","A","NodeDB","D","B"],
+              "order audit table records root and all nodes in deterministic phylogenetic order")
+        check(order_rows[0]["sequence_available"]=="False" and order_rows[0]["sequence_fasta_rank"]=="NA",
+              "clock=0 root is documented but not fabricated in the MSA")
+
+
+def test_runner_orchestration_through_events():
+    print("runner orchestration through events (mock MACSE, no real external programs)")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td); bindir = tmp / "bin"; bindir.mkdir(); work = tmp / "work"; work.mkdir()
+        mock = bindir / "macse"
+        mock.write_text(r'''#!/usr/bin/env python3
+import sys
+from pathlib import Path
+args=sys.argv[1:]
+def val(k): return args[args.index(k)+1]
+seq=Path(val('-seq')); outnt=Path(val('-out_NT')); outaa=Path(val('-out_AA'))
+records=[]; name=None; chunks=[]
+for line in seq.read_text().splitlines():
+    if line.startswith('>'):
+        if name is not None: records.append((name,''.join(chunks)))
+        name=line[1:].split()[0]; chunks=[]
+    else: chunks.append(line.strip())
+if name is not None: records.append((name,''.join(chunks)))
+with outnt.open('w') as n, outaa.open('w') as a:
+    for name,s in records:
+        if name in {'A','B'}: s=s[:6]+'---'+s[9:]
+        n.write(f'>{name}\n{s}\n')
+        a.write(f'>{name}\n'+('X'*(len(s)//3))+'\n')
+''')
+        mock.chmod(0o755)
+        fa = tmp / "T.fasta"
+        seq = "ATGCCCAAAGGGTTTCCC"
+        fa.write_text("".join(f">{x}\n{seq}\n" for x in "ABCD"))
+        tree = tmp / "tree.nwk"; tree.write_text("((A:1,B:1):1,(C:1,D:1):1);\n")
+        env = os.environ.copy(); env["PATH"] = f"{bindir}:{env['PATH']}"
+        r = subprocess.run([str(ROOT/"scripts"/"run_one_gene_00_to_04.sh"),
+                            "--gene","T","--fasta",str(fa),"--tree",str(tree),"--workdir",str(work),
+                            "--run_up_to","events","--alignment","perform","--indelmap","no"],
+                           capture_output=True, text=True, env=env)
+        check(r.returncode == 0, f"runner reaches events without missing step02 file ({r.stderr[-180:]})")
+        check((work/"results_02/T/02_T.codon_for_paml.phy").stat().st_size > 0,
+              "runner created the file that v3.25 previously failed to create")
+        check((work/"results_03/T/03_T.alignment_events.tsv").stat().st_size > 0,
+              "runner reaches and completes event reconstruction")
+
+
+
+def test_runner_orchestration_through_integrate():
+    print("runner orchestration through integrate (mock MACSE + mock codeml)")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td); bindir = tmp / "bin"; bindir.mkdir(); work = tmp / "work"; work.mkdir()
+
+        mock_macse = bindir / "macse"
+        mock_macse.write_text(r'''#!/usr/bin/env python3
+import sys
+from pathlib import Path
+args=sys.argv[1:]
+def val(k): return args[args.index(k)+1]
+seq=Path(val('-seq')); outnt=Path(val('-out_NT')); outaa=Path(val('-out_AA'))
+records=[]; name=None; chunks=[]
+for line in seq.read_text().splitlines():
+    if line.startswith('>'):
+        if name is not None: records.append((name,''.join(chunks)))
+        name=line[1:].split()[0]; chunks=[]
+    else: chunks.append(line.strip())
+if name is not None: records.append((name,''.join(chunks)))
+with outnt.open('w') as n, outaa.open('w') as a:
+    for name,s in records:
+        if name in {'A','B'}: s=s[:6]+'---'+s[9:]
+        n.write(f'>{name}\n{s}\n')
+        a.write(f'>{name}\n'+('X'*(len(s)//3))+'\n')
+''')
+        mock_macse.chmod(0o755)
+
+        mock_codeml = bindir / "codeml"
+        mock_codeml.write_text(r'''#!/usr/bin/env python3
+from pathlib import Path
+seq='ATGCCCAAAGGGTTTCCC'
+Path('rst').write_text(f"""tree with node labels for Rod Page's TreeView
+((1_A:0.1,2_B:0.1)6:0.1,(3_C:0.1,4_D:0.1)7:0.1)5;
+Nodes 5 to 7 are ancestral
+Unreliable at sites with alignment gaps
+
+(1) Marginal reconstruction of ancestral sequences
+node #5 {seq}
+node #6 {seq}
+node #7 {seq}
+Overall accuracy of the reconstruction
+""")
+Path('codon_asr.out').write_text('mock codeml output\n')
+''')
+        mock_codeml.chmod(0o755)
+
+        fa = tmp / "T.fasta"
+        seq = "ATGCCCAAAGGGTTTCCC"
+        fa.write_text("".join(f">{x}\n{seq}\n" for x in "ABCD"))
+        tree = tmp / "tree.nwk"; tree.write_text("((A:1,B:1):1,(C:1,D:1):1);\n")
+        env = os.environ.copy(); env["PATH"] = f"{bindir}:{env['PATH']}"
+        r = subprocess.run([str(ROOT/"scripts"/"run_one_gene_00_to_04.sh"),
+                            "--gene","T","--fasta",str(fa),"--tree",str(tree),"--workdir",str(work),
+                            "--run_up_to","integrate","--alignment","perform","--indelmap","no"],
+                           capture_output=True, text=True, env=env)
+        check(r.returncode == 0, f"runner reaches integration without v3.25 wiring failures ({r.stderr[-220:]})")
+        expected = [
+            (work/"results_02/T/02_T.codon_for_paml.phy", "runner creates PAML PHYLIP before invoking the backend"),
+            (work/"results_02/T/paml_codon_asr/rst", "runner invokes codeml after ASR inputs exist"),
+            (work/"results_03/T/03_T.alignment_events.tsv", "runner reconstructs events before ancestral integration"),
+            (work/"results_03/T/03_T.ancestral_integrated_alignment.fa", "runner completes Pensieve-state overlay onto PAML scaffold"),
+            (work/"results_03/T/04_T.ancestral_orf_walk.tsv", "runner completes lesion-aware ORF history"),
+            (work/"final_results/T/important_output/T.ancestral_integrated_alignment.fa", "integrated core output is copied into final_results"),
+            (work/"final_results/T/important_output/T.phylogenetic_msa.fasta", "combined phylogenetic tip+internode MSA is copied into final_results"),
+            (work/"final_results/T/important_output/T.phylogenetic_sequence_order.tsv", "phylogenetic sequence-order audit is copied into final_results"),
+            (work/"final_results/T/important_output/T.phylogenetic_tip_order.tsv", "phylogenetic tip-order audit is copied into final_results"),
+        ]
+        for path, message in expected:
+            check(path.exists() and path.stat().st_size > 0, message)
+
+def test_mock_paml_integration_and_root_policy():
+    print("mock PAML integration and root policy")
+    with tempfile.TemporaryDirectory() as td:
+        tmp=Path(td); r2=tmp/"r2"; r3=tmp/"r3"; (r2/"paml_codon_asr").mkdir(parents=True); r3.mkdir()
+        (r2/"02_T.codon_for_paml.phy").write_text("4 12\nA ATGAAACCCGGG\nB ATGAAACCCGGG\nC ATGAAACCCGGG\nD ATGAAACCCGGG\n")
+        (r2/"02_T.tree_for_asr.nwk").write_text("((A:1,B:1):1,(C:1,D:1):1);\n")
+        aln=tmp/"aln.fa"; aln.write_text("".join(f">{x}\nATGAAACCCGGG\n" for x in "ABCD"))
+        er=subprocess.run([sys.executable,str(ROOT/"scripts"/"03_alignment_events.py"),"--gene","T",
+                           "--alignment",str(aln),"--tree",str(r2/"02_T.tree_for_asr.nwk"),"--outdir",str(r3)],
+                          capture_output=True,text=True)
+        check(er.returncode==0,"event tree prepared for PAML mapping test")
+        (r2/"paml_codon_asr/rst").write_text('''tree with node labels for Rod Page's TreeView
+((1_A:0.1,2_B:0.1)6:0.1,(3_C:0.1,4_D:0.1)7:0.1)5;
+Nodes 5 to 7 are ancestral
+Unreliable at sites with alignment gaps
+
+(1) Marginal reconstruction of ancestral sequences
+node #5 ATGAAACCCGGG
+node #6 ATGAAACCCGGG
+node #7 ATGAAACCCGGG
+Overall accuracy of the reconstruction
+''')
+        ir=subprocess.run([sys.executable,str(ROOT/"scripts"/"03_integrate_asr_evidence.py"),"--gene","T",
+                           "--results02-dir",str(r2),"--results00-dir",str(tmp/"r0"),"--outdir",str(r3),
+                           "--on-missing-root-sequence","warn"],capture_output=True,text=True)
+        check(ir.returncode==0,f"mock PAML marginal sequences map to Pensieve nodes ({ir.stderr[:120]})")
+        cross=tsv(r3/"03_T.internode_label_crosswalk.tsv")
+        root=[x for x in cross if x["is_user_tree_root"]=="True"]
+        check(root and root[0]["paml_node_label"]=="NA" and root[0]["mapping_status"]=="NO_PAML_SEQUENCE_EXPECTED",
+              "biological root is not assigned a fabricated clock=0 PAML sequence")
+        all_declared=fasta(r3/"03_T.paml_marginal_asr_all_declared_nodes.fa")
+        biological=fasta(r3/"03_T.paml_marginal_asr.fa")
+        check(set(all_declared)=={"PAML_Node5","PAML_Node6","PAML_Node7"},
+              "all rst-declared PAML marginal nodes are retained for audit")
+        check(set(biological)=={"PAML_Node6","PAML_Node7"},
+              "serialization/root-only PAML node is excluded from biological non-root ASR")
+        orf=subprocess.run([sys.executable,str(ROOT/"scripts"/"04_ancestral_orf_walk.py"),"--gene","T",
+                            "--paml-tree",str(r3/"03_T.paml_labeled_reporting_tree.nwk"),
+                            "--pensieve-tree",str(r3/"03_T.pensieve_labelled_dated_tree.nwk"),
+                            "--ancestral-fasta",str(r3/"03_T.paml_marginal_asr.fa"),"--tip-alignment",str(aln),
+                            "--character-states",str(r3/"03_T.alignment_character_node_states.tsv"),
+                            "--characters",str(r3/"03_T.alignment_characters.tsv"),
+                            "--events",str(r3/"03_T.alignment_events.tsv"),
+                            "--frame-arithmetic",str(r3/"03_T.frame_arithmetic_by_node.tsv"),"--outdir",str(r3)],
+                           capture_output=True,text=True)
+        check(orf.returncode==0,f"native ancestral ORF integration runs ({orf.stderr[:120]})")
+        root_status=[x for x in tsv(r3/"04_T.ancestral_orf_walk.tsv") if x["node_type"]=="root"]
+        check(root_status and root_status[0]["coding_status"]=="unavailable",
+              "root ORF status remains unavailable rather than invented")
+
+
+def test_root_adjacent_uncertainty_is_explicit():
+    print("root-adjacent substitution-only disruption is explicit, not generic uncertain")
+    with tempfile.TemporaryDirectory() as td:
+        tmp=Path(td); out=tmp/"o"; out.mkdir()
+        pens=tmp/"pens.nwk"; pens.write_text("((A:1,B:1)NodeAB:1,(C:1,D:1)NodeCD:1)UserRoot;\n")
+        paml=tmp/"paml.nwk"; paml.write_text("((A:1,B:1)PAB:1,(C:1,D:1)PCD:1)PRoot;\n")
+        # PAB lacks ATG while PCD is intact. There is no explicit event character,
+        # so the UserRoot->NodeAB first-loss placement must remain unresolved.
+        asr=tmp/"asr.fa"; asr.write_text(">PAB\nGTGAAACCCGGG\n>PCD\nATGAAACCCGGG\n")
+        tips=tmp/"tips.fa"; tips.write_text(">A\nGTGAAACCCGGG\n>B\nGTGAAACCCGGG\n>C\nATGAAACCCGGG\n>D\nATGAAACCCGGG\n")
+        chars=tmp/"chars.tsv"; write_table(chars,["character_id","character_class","alignment_start","alignment_end","length_mod_3","stop_codon"],[])
+        states=tmp/"states.tsv"; write_table(states,["character_id","node_label","state"],[])
+        events=tmp/"events.tsv"; write_table(events,["event_id","branch","character_class","biological_interpretation","length_mod_3","direction_confident"],[])
+        frame=tmp/"frame.tsv"; write_table(frame,["node_label","frame_currently_shifted","structural_state_ambiguous"],[])
+        r=subprocess.run([sys.executable,str(ROOT/"scripts"/"04_ancestral_orf_walk.py"),"--gene","T",
+                          "--paml-tree",str(paml),"--pensieve-tree",str(pens),"--ancestral-fasta",str(asr),
+                          "--tip-alignment",str(tips),"--character-states",str(states),"--characters",str(chars),
+                          "--events",str(events),"--frame-arithmetic",str(frame),"--outdir",str(out)],
+                         capture_output=True,text=True)
+        check(r.returncode==0, f"root-adjacent uncertainty case runs ({r.stderr[:160]})")
+        br={x["branch"]:x for x in tsv(out/"04_T.orf_transitions_by_branch.tsv")}
+        row=br["UserRoot->NodeAB"]
+        check(row["orf_transition"]=="root_adjacent_disruption_first_loss_unresolved",
+              "root-adjacent sequence disruption gets a specific first-loss-unresolved label")
+        check(row["uncertainty_reason"]=="no_distinct_clock0_biological_root_sequence",
+              "root-adjacent asymmetry is explicitly explained in the output")
+        check(row["known_pseudogenic_history"]=="True",
+              "disrupted child establishes sticky pseudogenic history without inventing a root sequence")
+
+
+def test_uncertain_root_resolves_to_intact_once_descendants_are_confidently_intact():
+    # Real bug found by reviewing genuine HPC runs (GUCA1B/GUCA1C/CNGA3): the
+    # biological root never gets a fabricated sequence, so its own
+    # pseudogenic-history state starts "unresolved" for every gene by design.
+    # Before this fix, once a node's history was unresolved it could only ever
+    # become "confirmed disabling" -- there was no path back to "confidently
+    # clean", so "history_uncertain_no_confirmed_event" (plotted as an
+    # unbroken chain of amber/orange branches) silently propagated down
+    # EVERY descendant branch forever, even when a node's own reconstructed
+    # sequence was a plainly intact ORF with no disabling event anywhere near
+    # it, and even when both the parent and child of a branch were already
+    # individually reported "intact". A tree that is entirely clean below an
+    # uncertain root must read as clean, not as one giant uncertain lineage.
+    print("root history unresolved by design does not poison confidently intact descendants")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td); out = tmp / "o"; out.mkdir()
+        pens = tmp / "pens.nwk"; pens.write_text("((A:1,B:1)Node1:1,(C:1,D:1)Node2:1)Root;\n")
+        paml = tmp / "paml.nwk"; paml.write_text("((A:1,B:1)P1:1,(C:1,D:1)P2:1)PRoot;\n")
+        # Every reconstructed/observed sequence is a clean, identical, intact ORF.
+        asr = tmp / "asr.fa"; asr.write_text(">P1\nATGAAACCCGGG\n>P2\nATGAAACCCGGG\n")
+        tips = tmp / "tips.fa"; tips.write_text("".join(f">{x}\nATGAAACCCGGG\n" for x in "ABCD"))
+        chars = tmp / "chars.tsv"
+        write_table(chars, ["character_id", "character_class", "alignment_start", "alignment_end",
+                             "length_mod_3", "stop_codon"], [
+            {"character_id": "IND0001", "character_class": "indel", "alignment_start": 4,
+             "alignment_end": 4, "length_mod_3": 1, "stop_codon": "NA"},
+        ])
+        # Only the root's state for this frame-shifting-length character is
+        # ambiguous (root_history_uncertain=True); every node actually inside
+        # the sampled tree has a definite reconstructed state (as a real
+        # Sankoff pass always produces), and it is never actually
+        # observed/gained on any branch (events.tsv below is empty).
+        states = tmp / "states.tsv"
+        write_table(states, ["character_id", "node_label", "state"], [
+            {"character_id": "IND0001", "node_label": "Root", "state": "ambiguous"},
+            {"character_id": "IND0001", "node_label": "Node1", "state": "residue"},
+            {"character_id": "IND0001", "node_label": "Node2", "state": "residue"},
+        ])
+        events = tmp / "events.tsv"
+        write_table(events, ["event_id", "branch", "character_class", "biological_interpretation",
+                              "length_mod_3", "direction_confident"], [])
+        frame = tmp / "frame.tsv"; write_table(frame, ["node_label", "frame_currently_shifted",
+                                                         "structural_state_ambiguous"], [])
+        r = subprocess.run([sys.executable, str(ROOT / "scripts" / "04_ancestral_orf_walk.py"), "--gene", "T",
+                             "--paml-tree", str(paml), "--pensieve-tree", str(pens), "--ancestral-fasta", str(asr),
+                             "--tip-alignment", str(tips), "--character-states", str(states), "--characters", str(chars),
+                             "--events", str(events), "--frame-arithmetic", str(frame), "--outdir", str(out)],
+                            capture_output=True, text=True)
+        check(r.returncode == 0, f"uncertain-root synthetic case runs ({r.stderr[:160]})")
+        rows = tsv(out / "04_T.orf_transitions_by_branch.tsv")
+        br = {x["branch"]: x for x in rows}
+        not_intact = [b for b, x in br.items() if x["orf_transition"] != "intact"]
+        check(not not_intact,
+              f"every branch below the uncertain root resolves to 'intact', not stuck 'uncertain' ({not_intact})")
+        check(all(x["child_coding_status"] == "intact" for x in rows),
+              "every node's own coding status is intact")
+        check(br["Root->Node1"]["transition_evidence"] == "no_inferred_disabling_history"
+              and br["Node1->A"]["transition_evidence"] == "no_inferred_disabling_history",
+              "resolved branches carry the normal clean-history evidence label, not a lingering uncertainty one")
+
+
+def test_ambiguous_in_frame_indel_does_not_force_node_uncertain():
+    # Real bug found by reviewing genuine HPC runs (GUCA1B/GUCA1C/CNGA3): any
+    # character with an ambiguous/unresolved reconstructed state at a node
+    # marked that node's whole ORF-completeness call "uncertain", even for a
+    # small in-frame indel whose gap/residue polarity cannot possibly change
+    # whether the resulting sequence has a valid, complete ORF (it changes
+    # neither the reading frame nor the stop-codon content). Genes with many
+    # ordinary in-frame indels -- not itself unusual or evidence of anything
+    # -- had nearly every internal node marked "uncertain" as a result, which
+    # then cascaded into "history_uncertain_no_confirmed_event" everywhere.
+    print("an ambiguous in-frame indel does not force a node's ORF status to uncertain")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td); out = tmp / "o"; out.mkdir()
+        pens = tmp / "pens.nwk"; pens.write_text("((A:1,B:1)Node1:1,C:1)Root;\n")
+        paml = tmp / "paml.nwk"; paml.write_text("((A:1,B:1)P1:1,C:1)PRoot;\n")
+        asr = tmp / "asr.fa"; asr.write_text(">P1\nATGAAACCCGGG\n")
+        tips = tmp / "tips.fa"; tips.write_text("".join(f">{x}\nATGAAACCCGGG\n" for x in "ABC"))
+        chars = tmp / "chars.tsv"
+        write_table(chars, ["character_id", "character_class", "alignment_start", "alignment_end",
+                             "length_mod_3", "stop_codon"], [
+            # A 3-bp (in-frame) indel: length_mod_3 = 0.
+            {"character_id": "IND0001", "character_class": "indel", "alignment_start": 4,
+             "alignment_end": 6, "length_mod_3": 0, "stop_codon": "NA"},
+        ])
+        # Node1's own reconstruction of this in-frame indel is a genuine
+        # parsimony tie (ambiguous) -- e.g. equally good as an insertion on
+        # one side or a deletion on the other -- with no bearing on frame or
+        # stop-codon content either way.
+        states = tmp / "states.tsv"
+        write_table(states, ["character_id", "node_label", "state"], [
+            {"character_id": "IND0001", "node_label": "Node1", "state": "ambiguous"},
+        ])
+        events = tmp / "events.tsv"
+        write_table(events, ["event_id", "branch", "character_class", "biological_interpretation",
+                              "length_mod_3", "direction_confident"], [])
+        frame = tmp / "frame.tsv"; write_table(frame, ["node_label", "frame_currently_shifted",
+                                                         "structural_state_ambiguous"], [])
+        r = subprocess.run([sys.executable, str(ROOT / "scripts" / "04_ancestral_orf_walk.py"), "--gene", "T",
+                             "--paml-tree", str(paml), "--pensieve-tree", str(pens), "--ancestral-fasta", str(asr),
+                             "--tip-alignment", str(tips), "--character-states", str(states), "--characters", str(chars),
+                             "--events", str(events), "--frame-arithmetic", str(frame), "--outdir", str(out)],
+                            capture_output=True, text=True)
+        check(r.returncode == 0, f"ambiguous in-frame indel synthetic case runs ({r.stderr[:160]})")
+        walk = {x["node_label"]: x for x in tsv(out / "04_T.ancestral_orf_walk.tsv")}
+        check(walk["Node1"]["coding_status"] == "intact",
+              f"Node1 stays intact despite the ambiguous in-frame indel reconstruction ({walk['Node1']})")
+
+
+def test_terminal_stop_reconstructed_at_ancestral_nodes():
+    # Real bug found by inspecting real ancestral sequence FASTAs directly
+    # (PDE6H, GUCA1C): PAML's codon-substitution model has a 61-state,
+    # sense-codon-only state space by construction, so it can never
+    # reconstruct a stop codon anywhere -- including the ordinary, universal
+    # terminal stop present in virtually every intact tip, which is masked to
+    # N for every tip (not just ancestors) before codeml ever sees it. Every
+    # internal node's PAML-derived sequence therefore had some arbitrary
+    # non-stop codon at the true C-terminus instead (e.g. real runs showed
+    # AAG in PDE6H, TTA in GUCA1C). This is a real output-correctness issue,
+    # not a pseudogenization-classification one (a non-stop codon there
+    # doesn't happen to look like an "internal stop", so branch calls were
+    # never actually wrong) -- but the exported ancestral sequences
+    # themselves were biologically nonsensical at that column.
+    print("terminal stop codon is reconstructed correctly at ancestral nodes, not left as PAML's uninformed guess")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td); out = tmp / "o"; out.mkdir()
+        pens = tmp / "pens.nwk"; pens.write_text("((A:1,B:1)Node1:1,(C:1,D:1)Node2:1)Root;\n")
+        paml = tmp / "paml.nwk"; paml.write_text("((A:1,B:1)P1:1,(C:1,D:1)P2:1)PRoot;\n")
+        # Every tip genuinely ends in the same real stop codon, TGA.
+        tips = tmp / "tips.fa"
+        tips.write_text("".join(f">{x}\nATGAAACCCTGA\n" for x in "ABCD"))
+        # Simulates PAML's own (necessarily wrong, since it cannot represent a
+        # stop) reconstruction: some arbitrary sense codon, AAG, in that
+        # position instead of the real ancestral TGA.
+        asr = tmp / "asr.fa"; asr.write_text(">P1\nATGAAACCCAAG\n>P2\nATGAAACCCAAG\n")
+        chars = tmp / "chars.tsv"
+        write_table(chars, ["character_id", "character_class", "alignment_start", "alignment_end",
+                             "length_mod_3", "stop_codon"], [])
+        states = tmp / "states.tsv"; write_table(states, ["character_id", "node_label", "state"], [])
+        events = tmp / "events.tsv"
+        write_table(events, ["event_id", "branch", "character_class", "biological_interpretation",
+                              "length_mod_3", "direction_confident"], [])
+        frame = tmp / "frame.tsv"; write_table(frame, ["node_label", "frame_currently_shifted",
+                                                         "structural_state_ambiguous"], [])
+        r = subprocess.run([sys.executable, str(ROOT / "scripts" / "04_ancestral_orf_walk.py"), "--gene", "T",
+                             "--paml-tree", str(paml), "--pensieve-tree", str(pens), "--ancestral-fasta", str(asr),
+                             "--tip-alignment", str(tips), "--character-states", str(states), "--characters", str(chars),
+                             "--events", str(events), "--frame-arithmetic", str(frame), "--outdir", str(out)],
+                            capture_output=True, text=True)
+        check(r.returncode == 0, f"terminal-stop synthetic case runs ({r.stderr[:160]})")
+        integrated = fasta(out / "03_T.ancestral_integrated_alignment.fa")
+        check(integrated.get("Node1", "")[-3:] == "TGA" and integrated.get("Node2", "")[-3:] == "TGA",
+              f"both ancestral nodes are reconstructed with the real terminal stop, not PAML's AAG "
+              f"(Node1={integrated.get('Node1')}, Node2={integrated.get('Node2')})")
+        walk = {x["node_label"]: x for x in tsv(out / "04_T.ancestral_orf_walk.tsv")}
+        check(walk["Node1"]["has_terminal_stop"] == "True" and walk["Node2"]["has_terminal_stop"] == "True",
+              "the ORF check on the corrected ancestral sequence now also recognises the terminal stop")
+
+
+def test_terminal_stop_gap_majority_uses_each_lineages_own_true_ending():
+    # Real finding while re-verifying the fix above against genuine GUCA1C
+    # data: at the alignment's literal last 3 columns, only a few taxa with
+    # the longest aligned CDS have a real base there -- but EVERY tip
+    # (checked directly, gaps stripped) has its own perfectly real, valid
+    # terminal codon; the majority just do not reach the alignment's widest
+    # point because a few other lineages have a longer real C-terminal tail.
+    # An earlier version of this fix treated "does not reach the alignment's
+    # final columns" as "no stop codon here" and wrote a blank gap for most
+    # ancestors -- technically self-consistent, but not what the alignment
+    # actually shows: it does not mean those ancestors had no stop codon, it
+    # only reflects a column-registration artifact of a few longer, unrelated
+    # lineages. own_terminal_codon()/fitch_reconstruct_codon() work from each
+    # tip's own real sequence instead, so the ancestor of a set of
+    # genuinely-shorter taxa gets ITS OWN real reconstructed ending, not a
+    # blank standing in for "we don't know".
+    print("a genuinely shorter-CDS clade gets its own real reconstructed ending, not a blank gap")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td); out = tmp / "o"; out.mkdir()
+        # A and B (under Node1) have a longer true CDS, ending ...CCCTGA;
+        # C, D and E (under Node2) are genuinely 3 codons shorter -- their own
+        # real sequence ends ...CCC, with no TGA anywhere in it at all.
+        pens = tmp / "pens.nwk"
+        pens.write_text("((A:1,B:1)Node1:1,(C:1,(D:1,E:1)Node3:1)Node2:1)Root;\n")
+        paml = tmp / "paml.nwk"
+        paml.write_text("((A:1,B:1)P1:1,(C:1,(D:1,E:1)P3:1)P2:1)PRoot;\n")
+        asr = tmp / "asr.fa"
+        asr.write_text(">P1\nATGAAACCCAAG\n>P2\nATGAAACCC---\n>P3\nATGAAACCC---\n")
+        tips = tmp / "tips.fa"
+        tips.write_text(
+            ">A\nATGAAACCCTGA\n>B\nATGAAACCCTGA\n"
+            ">C\nATGAAACCC---\n>D\nATGAAACCC---\n>E\nATGAAACCC---\n"
+        )
+        chars = tmp / "chars.tsv"
+        write_table(chars, ["character_id", "character_class", "alignment_start", "alignment_end",
+                             "length_mod_3", "stop_codon"], [])
+        states = tmp / "states.tsv"; write_table(states, ["character_id", "node_label", "state"], [])
+        events = tmp / "events.tsv"
+        write_table(events, ["event_id", "branch", "character_class", "biological_interpretation",
+                              "length_mod_3", "direction_confident"], [])
+        frame = tmp / "frame.tsv"; write_table(frame, ["node_label", "frame_currently_shifted",
+                                                         "structural_state_ambiguous"], [])
+        r = subprocess.run([sys.executable, str(ROOT / "scripts" / "04_ancestral_orf_walk.py"), "--gene", "T",
+                             "--paml-tree", str(paml), "--pensieve-tree", str(pens), "--ancestral-fasta", str(asr),
+                             "--tip-alignment", str(tips), "--character-states", str(states), "--characters", str(chars),
+                             "--events", str(events), "--frame-arithmetic", str(frame), "--outdir", str(out)],
+                            capture_output=True, text=True)
+        check(r.returncode == 0, f"gap-majority terminal-stop synthetic case runs ({r.stderr[:160]})")
+        integrated = fasta(out / "03_T.ancestral_integrated_alignment.fa")
+        check(integrated.get("Node1", "")[-3:] == "TGA",
+              f"Node1 (MRCA of the longer-CDS taxa) gets their real reconstructed stop ({integrated.get('Node1')})")
+        check(integrated.get("Node2", "")[-3:] == "CCC",
+              f"Node2 (MRCA of the genuinely shorter-CDS taxa) gets ITS OWN real reconstructed ending, "
+              f"not a blank stand-in for the longer clade's stop ({integrated.get('Node2')})")
+
+
+def test_terminal_stop_scattered_by_unrelated_insertion_still_reads_correctly():
+    # Real bug found by inspecting genuine CNGA3/GUCA1B ancestral sequences
+    # directly: a tip's own real, contiguous terminal codon can be scattered
+    # across NON-adjacent alignment columns whenever an unrelated lineage has
+    # extra sequence nearby -- the tip's own real sequence has no gap in it
+    # at all, the gap is purely a multiple-alignment artifact of giving every
+    # taxon a shared coordinate system. Reading a fixed 3-column window
+    # directly off the raw alignment (an earlier version of this fix did
+    # exactly that, just with gap treated as a real state) reads whatever
+    # fragments happen to land in that window and can reconstruct a
+    # completely wrong codon, even though every relevant tip's own real
+    # sequence agrees. own_terminal_codon() strips gaps first, so it is
+    # immune to this regardless of how a nearby unrelated insertion
+    # scattered the columns.
+    print("a real terminal codon scattered across non-adjacent columns by an unrelated insertion is still read correctly")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td); out = tmp / "o"; out.mkdir()
+        pens = tmp / "pens.nwk"; pens.write_text("((A:1,B:1)Node1:1,C:1)Root;\n")
+        paml = tmp / "paml.nwk"; paml.write_text("((A:1,B:1)P1:1,C:1)PRoot;\n")
+        asr = tmp / "asr.fa"; asr.write_text(">P1\nATGAAACCCGAAA\n")
+        # A and B's own real, ungapped sequence is ATGAAACCCTGA (12 real
+        # bases, ending in a perfectly valid TGA) -- but C has one extra real
+        # base at that exact position, so A and B are aligned with a gap
+        # inserted in the MIDDLE of their own real terminal codon, splitting
+        # "T" from "GA" across non-adjacent columns purely because of C's
+        # unrelated extra base, not anything in A or B's own sequence.
+        tips = tmp / "tips.fa"
+        tips.write_text(
+            ">A\nATGAAACCCT-GA\n>B\nATGAAACCCT-GA\n>C\nATGAAACCCTGAA\n"
+        )
+        chars = tmp / "chars.tsv"
+        write_table(chars, ["character_id", "character_class", "alignment_start", "alignment_end",
+                             "length_mod_3", "stop_codon"], [])
+        states = tmp / "states.tsv"; write_table(states, ["character_id", "node_label", "state"], [])
+        events = tmp / "events.tsv"
+        write_table(events, ["event_id", "branch", "character_class", "biological_interpretation",
+                              "length_mod_3", "direction_confident"], [])
+        frame = tmp / "frame.tsv"; write_table(frame, ["node_label", "frame_currently_shifted",
+                                                         "structural_state_ambiguous"], [])
+        r = subprocess.run([sys.executable, str(ROOT / "scripts" / "04_ancestral_orf_walk.py"), "--gene", "T",
+                             "--paml-tree", str(paml), "--pensieve-tree", str(pens), "--ancestral-fasta", str(asr),
+                             "--tip-alignment", str(tips), "--character-states", str(states), "--characters", str(chars),
+                             "--events", str(events), "--frame-arithmetic", str(frame), "--outdir", str(out)],
+                            capture_output=True, text=True)
+        check(r.returncode == 0, f"scattered-codon synthetic case runs ({r.stderr[:160]})")
+        integrated = fasta(out / "03_T.ancestral_integrated_alignment.fa")
+        check(integrated.get("Node1", "")[-3:] == "TGA",
+              f"Node1 (MRCA of A and B) correctly reconstructs TGA despite the raw alignment scattering it "
+              f"across non-adjacent columns ({integrated.get('Node1')})")
+
+
+def test_sticky_pseudogenic_history():
+    print("sticky pseudogenic history after compensatory change")
+    # Directly exercise the ORF-walk executable with a deep tree and hand-built
+    # event/state tables. Node2->Node1 gets a 1-bp deletion; Node1->A gets a
+    # 1-bp residue restoration. A is ORF-intact, but the branch must not turn
+    # into a new pseudogenization or erase the inherited history.
+    with tempfile.TemporaryDirectory() as td:
+        tmp=Path(td); out=tmp/"o"; out.mkdir()
+        pens=tmp/"pens.nwk"; pens.write_text("(((A:1,B:1)Node1:1,C:1)Node2:1,D:1)Node3;\n")
+        paml=tmp/"paml.nwk"; paml.write_text("(((A:1,B:1)P1:1,C:1)P2:1,D:1)PRoot;\n")
+        asr=tmp/"asr.fa"; asr.write_text(">P1\nATGAAACCCGGG\n>P2\nATGAAACCCGGG\n")
+        tips=tmp/"tips.fa"; tips.write_text(">A\nATGAAACCCGGG\n>B\nATGAA-CCCGGG\n>C\nATGAAACCCGGG\n>D\nATGAAACCCGGG\n")
+        chars=tmp/"chars.tsv"
+        write_table(chars,["character_id","character_class","alignment_start","alignment_end","length_mod_3","stop_codon"],[
+            {"character_id":"IND0001","character_class":"indel","alignment_start":6,"alignment_end":6,"length_mod_3":1,"stop_codon":"NA"}
+        ])
+        states=tmp/"states.tsv"
+        write_table(states,["character_id","node_label","state"],[
+            {"character_id":"IND0001","node_label":"Node3","state":"residue"},
+            {"character_id":"IND0001","node_label":"Node2","state":"residue"},
+            {"character_id":"IND0001","node_label":"Node1","state":"gap"},
+            {"character_id":"IND0001","node_label":"A","state":"residue"},
+            {"character_id":"IND0001","node_label":"B","state":"gap"},
+            {"character_id":"IND0001","node_label":"C","state":"residue"},
+            {"character_id":"IND0001","node_label":"D","state":"residue"},
+        ])
+        events=tmp/"events.tsv"
+        write_table(events,["event_id","branch","character_class","biological_interpretation","length_mod_3","direction_confident"],[
+            {"event_id":"del","branch":"Node2->Node1","character_class":"indel","biological_interpretation":"deletion","length_mod_3":1,"direction_confident":True},
+            {"event_id":"comp","branch":"Node1->A","character_class":"indel","biological_interpretation":"insertion_or_restoration","length_mod_3":1,"direction_confident":True},
+        ])
+        frame=tmp/"frame.tsv"; write_table(frame,["node_label","frame_currently_shifted","structural_state_ambiguous"],[])
+        r=subprocess.run([sys.executable,str(ROOT/"scripts"/"04_ancestral_orf_walk.py"),"--gene","T",
+                          "--paml-tree",str(paml),"--pensieve-tree",str(pens),"--ancestral-fasta",str(asr),
+                          "--tip-alignment",str(tips),"--character-states",str(states),"--characters",str(chars),
+                          "--events",str(events),"--frame-arithmetic",str(frame),"--outdir",str(out)],
+                         capture_output=True,text=True)
+        check(r.returncode==0,f"sticky-history synthetic case runs ({r.stderr[:120]})")
+        br={x["branch"]:x for x in tsv(out/"04_T.orf_transitions_by_branch.tsv")}
+        check(br["Node2->Node1"]["orf_transition"]=="pseudogenization",
+              "first confident frameshift is the pseudogenization branch")
+        check(br["Node1->A"]["orf_transition"]=="apparent_orf_restoration",
+              "compensatory indel is annotated as apparent restoration, not a second loss")
+        check(br["Node1->A"]["known_pseudogenic_history"]=="True",
+              "compensatory branch retains inherited pseudogenic history")
+
+
+def main():
+    test_static_and_cli()
+    test_breakpoint_decomposition()
+    test_guca1b_breakpoint_history_end_to_end()
+    test_parsimony_tie_and_direction()
+    test_stop_alleles_are_separate()
+    test_shared_stop_not_missed_when_only_one_tip_is_registered()
+    test_compensated_frameshift_stop_classification()
+    test_canonical_alignment_prepare()
+    test_phylogenetic_sequence_ordering()
+    test_runner_orchestration_through_events()
+    test_runner_orchestration_through_integrate()
+    test_mock_paml_integration_and_root_policy()
+    test_root_adjacent_uncertainty_is_explicit()
+    test_uncertain_root_resolves_to_intact_once_descendants_are_confidently_intact()
+    test_ambiguous_in_frame_indel_does_not_force_node_uncertain()
+    test_terminal_stop_reconstructed_at_ancestral_nodes()
+    test_terminal_stop_gap_majority_uses_each_lineages_own_true_ending()
+    test_terminal_stop_scattered_by_unrelated_insertion_still_reads_correctly()
+    test_sticky_pseudogenic_history()
+    if FAILURES:
+        print(f"\n{len(FAILURES)} failure(s)")
+        sys.exit(1)
+    print("\nBackend consistency test passed.")
+
+
+if __name__ == "__main__":
+    main()

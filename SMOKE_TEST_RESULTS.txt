@@ -1,0 +1,81 @@
+Pensieve v3.33 validation summary
+=================================
+
+Scope of v3.33
+--------------
+v3.33 fixes real bugs found by actually installing and running Pensieve end to
+end on a local Mac (conda, no Slurm) rather than only against mocked external
+tools:
+  - install.sh: a heredoc backtick bug that printed spurious
+    "command not found: --env-mode" / "command not found: -n" errors after
+    every successful install (cosmetic; install itself succeeded).
+  - bin/pensieve: PAML's dat/ directory is now auto-detected from wherever
+    codeml actually resolves for the chosen --env-mode instead of always
+    pointing at Pensieve's own empty placeholder dat/.
+  - scripts/03_integrate_asr_evidence.py (shared by 02_validate_paml_marginal.py):
+    a real rst-parsing bug that misread codeml's "Overall accuracy of the N
+    ancestral sequences:" / "Amino acid sequences inferred by codonml." blocks
+    as duplicate marginal node records, hard-failing every real multi-node ASR
+    run. Every previous mock rst fixture omitted these blocks, so this was
+    invisible until a genuine codeml run was tried.
+  - scripts/02_run_asr_backends.sh + 03_integrate_asr_evidence.py: IndelMaP was
+    invoked with the wrong CLI flags entirely and its output was looked up
+    under the wrong filenames, so its concordance evidence silently never ran.
+See CHANGELOG.md (v3.33) for full detail. v3.32's PAML early-stop-before-joint-
+reconstruction fix and v3.30's rst-driven ASR-completeness logic are otherwise
+unchanged and re-verified.
+
+This build was validated with the real toolchain in a local conda environment
+(env name "Pensieve": codeml/PAML 4.10.10, MACSE, IndelMaP cloned from
+acg-team/indelMaP, R/ggplot2), not only synthetic mocks.
+
+Passed checks (bash tests/smoke_test.sh, run inside the real conda env)
+-------------------------------------------------------------------------
+- Python syntax: bin/pensieve, scripts/*.py, tests/*.py
+- Shell syntax: install.sh, scripts/*.sh, tests/*.sh
+- Biological/orchestration synthetic suite: PASS
+- Reference-free + rst-driven safe codeml recovery suite: PASS
+  (includes a new regression test reproducing the real
+  accuracy/amino-acid-section rst structure, and a test proving codeml is
+  stopped well before a simulated 60s joint-reconstruction hang completes)
+- Installation/runtime portability suite: PASS
+- codeml control invariants: clock=0, fix_blength=0, cleandata=0, RateAncestor=1
+- Plot execution smoke test: PASS (Rscript + ggplot2/ape/dplyr/readr/stringr/
+  tidyr/optparse all present and produced real PDF/PNG output)
+
+Real end-to-end gene run (not part of the automated suite, run manually)
+--------------------------------------------------------------------------
+Gene: PDE6H, 18-species subset of input_files/sequences/PDE6H/PDE6H_bat1k.fa
+against input_files/bat1k_t2.nwk (tree auto-pruned to the subset by step00).
+Full pipeline (diagnostics -> alignment -> events -> asr -> integrate -> plot)
+completed successfully end to end:
+  - codeml crashed during joint reconstruction on this exact machine/build
+    too (not only large HPC trees); correctly recovered via the v3.32
+    validated-marginal-ASR path (pipeline_action=CONTINUE_WITH_VALIDATED_MARGINAL_ASR).
+  - IndelMaP ran for real and reported 68/68 comparable structural states in
+    agreement with Pensieve's own reconstruction (0 disagreements).
+  - The subset includes three species with genuine premature
+    stop codons/frameshifts (Desmodus_rotundus, Diaemus_youngii,
+    Triaenops_persicus) plus their intact relatives, including
+    Diphylla_ecaudata (an intact sister vampire-bat species). All three were
+    correctly and independently flagged pseudogenization/confident_disabling_event;
+    every clean species, including Diphylla_ecaudata, remained intact.
+  - final_results/PDE6H/important_output/PDE6H.pseudogenization_tree.pdf and
+    .event_map.pdf rendered correctly.
+
+Portability behaviours tested
+-----------------------------
+- installer supports auto, mamba, conda, staged, venv and current backends
+- venv/current do not create a conda/mamba environment
+- no executable path hard-codes `ml miniforge`, `mamba activate`, or
+  `conda activate`
+- local and Slurm default to --env-mode inherit
+- Slurm inherit emits no environment/module activation
+- explicit conda/mamba modes use `<manager> run -n ENV`
+- venv mode sources only the user-selected venv
+- --slurm-module is opt-in and preserves the user-provided module name
+- IndelMaP is fetched via `git clone https://github.com/acg-team/indelMaP.git`
+  into external/indelMaP, verified against the real repository; re-running
+  install.sh updates it in place (`git pull`) instead of re-cloning
+- PAML's dat/ directory is auto-detected from the active environment, never
+  hard-coded to a specific machine/user path

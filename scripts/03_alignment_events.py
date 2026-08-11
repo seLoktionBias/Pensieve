@@ -1,0 +1,912 @@
+#!/usr/bin/env python3
+"""Breakpoint-coded indel and mask events, placed on the dated tree by parsimony.
+
+Design notes (v3.30)
+--------------------
+1. INDEL CHARACTERS ARE CODED BY BREAKPOINTS, NOT BY COLUMNS.
+   Earlier versions cut a new block whenever the exact carrier set changed
+   between adjacent columns, so any unrelated lineage with an overlapping indel
+   split someone else's event.  On GUCA1B that fragmented one 42 bp Miniopterus
+   deletion into three blocks, and it can turn a single in-frame deletion into
+   several apparent frameshifts.  Here each maximal gap run per tip is extracted
+   as an interval, intervals are clustered by shared breakpoints, and each
+   cluster is ONE binary character (Simmons & Ochoterena simple indel coding).
+
+2. MACSE '!' IS A PARTIAL-CODON PLACEHOLDER, NOT AN EVENT DIRECTION.
+   In the native structural view '!' is rendered as '-' so the artificial frame-
+   restoration placeholder is removed. Whether the homologous change is an
+   insertion or deletion is inferred from the complete aligned occupancy pattern
+   and the phylogeny; Pensieve never equates one '!' with one deleted nucleotide.
+
+3. PLACEMENT IS BY PARSIMONY, NOT BY MRCA OF CARRIERS.
+   Equal-cost binary Sankoff on the dated tree.  Origins are branch transitions.
+   Root polarity is reconstructed, so a state carried by almost every tip is
+   reported as ancestral with descendant losses rather than as a root event.
+
+4. SUPPORT IS REPORTED.
+   For every node the cost of forcing PRESENT vs ABSENT is recorded; the
+   difference (delta-parsimony) is how many extra steps the alternative history
+   costs.  delta == 0 is an exact tie and is flagged, never silently resolved.
+
+5. FRAME ARITHMETIC IS SIGNED AND HISTORY-AWARE.
+   Confident residue->gap transitions contribute negative length (deletion) and
+   gap->residue transitions positive length (insertion). Current frame offset and
+   prior frameshifting history are reported separately. STOP mutations are not
+   called frame disruptions.
+
+Standard library only: no Biopython, no network.  This keeps the event engine
+testable in isolation from codeml and IndelMaP.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import re
+from collections import defaultdict
+from pathlib import Path
+
+ABSENT, PRESENT = 0, 1
+INF = float("inf")
+ACGT = set("ACGT")
+
+
+# ---------------------------------------------------------------- io
+
+def read_fasta(path):
+    records, order, name, buf = {}, [], None, []
+    with open(path) as handle:
+        for line in handle:
+            line = line.rstrip("\n\r")
+            if line.startswith(">"):
+                if name is not None:
+                    records[name] = "".join(buf)
+                header = line[1:].strip()
+                if not header:
+                    raise SystemExit(f"{path}: FASTA record with an empty identifier")
+                name = header.split()[0]
+                if name in records:
+                    raise SystemExit(f"{path}: duplicate FASTA identifier {name!r}")
+                order.append(name)
+                buf = []
+            elif line.strip():
+                buf.append(line.strip())
+    if name is not None:
+        records[name] = "".join(buf)
+    if not records:
+        raise SystemExit(f"{path}: no sequences found")
+    records = {k: v.upper().replace("U", "T") for k, v in records.items()}
+    lengths = {len(v) for v in records.values()}
+    if len(lengths) != 1:
+        raise SystemExit(f"{path}: sequences are not all the same length {sorted(lengths)}")
+    return records, order, lengths.pop()
+
+
+def read_tsv(path):
+    path = Path(path)
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    with path.open() as handle:
+        return list(csv.DictReader(handle, delimiter="\t"))
+
+
+def write_tsv(rows, path, header=None):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if header is None:
+        header = []
+        for row in rows:
+            for key in row:
+                if key not in header:
+                    header.append(key)
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, delimiter="\t", fieldnames=list(header),
+                                extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def safe_int(value):
+    try:
+        return int(float(str(value)))
+    except Exception:
+        return None
+
+
+def trueish(value):
+    return str(value).strip().lower() in {"true", "t", "1", "yes"}
+
+
+# ---------------------------------------------------------------- tree
+
+class Node:
+    __slots__ = ("name", "branch_length", "children", "parent", "is_tip", "idx")
+
+    def __init__(self):
+        self.name = ""
+        self.branch_length = None
+        self.children = []
+        self.parent = None
+        self.is_tip = False
+        self.idx = -1
+
+
+def parse_newick(path):
+    text = Path(path).read_text()
+    out, depth = [], 0
+    for ch in text:                      # strip [comments]
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            out.append(ch)
+    text = "".join(out).strip()
+    if ";" in text:
+        text = text[:text.index(";")]
+    tokens = re.findall(r"'[^']*'|\"[^\"]*\"|[(),:]|[^(),:;\s]+", text.strip())
+    pos = 0
+
+    def unquote(label):
+        label = label.strip()
+        if len(label) >= 2 and label[0] == label[-1] and label[0] in "'\"":
+            label = label[1:-1]
+        return label.strip()
+
+    def parse():
+        nonlocal pos
+        node = Node()
+        if pos < len(tokens) and tokens[pos] == "(":
+            pos += 1
+            while True:
+                child = parse()
+                child.parent = node
+                node.children.append(child)
+                if pos < len(tokens) and tokens[pos] == ",":
+                    pos += 1
+                    continue
+                break
+            if pos >= len(tokens) or tokens[pos] != ")":
+                raise SystemExit(f"{path}: malformed Newick, expected ')'")
+            pos += 1
+        if pos < len(tokens) and tokens[pos] not in {",", ")", ":"}:
+            node.name = unquote(tokens[pos])
+            pos += 1
+        if pos < len(tokens) and tokens[pos] == ":":
+            pos += 1
+            try:
+                node.branch_length = float(tokens[pos])
+            except (IndexError, ValueError):
+                raise SystemExit(f"{path}: malformed branch length")
+            pos += 1
+        node.is_tip = not node.children
+        return node
+
+    root = parse()
+    if pos != len(tokens):
+        raise SystemExit(f"{path}: trailing content after the root clade")
+    return root
+
+
+def iter_nodes(root, order="preorder"):
+    if order == "preorder":
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            yield node
+            stack.extend(reversed(node.children))
+    else:
+        out, stack = [], [(root, False)]
+        while stack:
+            node, done = stack.pop()
+            if done:
+                out.append(node)
+            else:
+                stack.append((node, True))
+                stack.extend((c, False) for c in reversed(node.children))
+        yield from out
+
+
+def collapse_unifurcations(root):
+    removed = []
+    changed = True
+    while changed:
+        changed = False
+        for node in list(iter_nodes(root, "preorder")):
+            if node.is_tip or len(node.children) != 1:
+                continue
+            child = node.children[0]
+            child.branch_length = (node.branch_length or 0.0) + (child.branch_length or 0.0)
+            child.parent = node.parent
+            if node.parent is None:
+                root = child
+            else:
+                node.parent.children[node.parent.children.index(node)] = child
+            removed.append(node.name or "<unlabelled>")
+            changed = True
+            break
+    return root, removed
+
+
+def apply_pensieve_labels(root, prefix="Node"):
+    """Label EVERY internal node with Pensieve's own postorder numbering.
+
+    Pensieve owns the internode namespace.  codeml's numbers are mapped onto
+    these labels by descendant-tip set in step 03b, so labels stay stable and
+    defined even when codeml is not run.
+    """
+    original = {}
+    counter = 0
+    for node in iter_nodes(root, "postorder"):
+        if node.is_tip:
+            if not node.name:
+                raise SystemExit("Tree contains an unnamed tip")
+            continue
+        counter += 1
+        original[f"{prefix}{counter}"] = node.name or "NA"
+        node.name = f"{prefix}{counter}"
+    for i, node in enumerate(iter_nodes(root, "postorder")):
+        node.idx = i
+    return root, original
+
+
+def write_newick(root, path):
+    def render(node):
+        text = f"({','.join(render(c) for c in node.children)}){node.name}" if node.children else node.name
+        if node.branch_length is not None:
+            text += f":{node.branch_length:.10g}"
+        return text
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(render(root) + ";\n")
+
+
+def node_ages(root, dated):
+    """Age before present for every node, from root-to-node depth."""
+    depth = {root: 0.0}
+    for node in iter_nodes(root, "preorder"):
+        for child in node.children:
+            depth[child] = depth[node] + (child.branch_length or 0.0)
+    tip_depth = [depth[n] for n in iter_nodes(root, "preorder") if n.is_tip]
+    tallest = max(tip_depth) if tip_depth else 0.0
+    if not dated:
+        return {n.name: "NA" for n in iter_nodes(root, "preorder")}
+    return {n.name: round(tallest - depth[n], 6) for n in iter_nodes(root, "preorder")}
+
+
+# ---------------------------------------------------------------- parsimony
+
+def sankoff(nodes_post, tip_states, gain_cost, loss_cost, tie_break):
+    """Binary Sankoff with explicit tie reporting and a representative history.
+
+    A representative assignment is needed for plotting/output, but equal-cost
+    alternatives remain explicitly ambiguous. No tie-break setting is allowed to
+    convert an exact tie into biological certainty.
+    """
+    trans = ((0.0, gain_cost), (loss_cost, 0.0))
+    down = {}
+    for node in nodes_post:
+        if node.is_tip:
+            obs = tip_states.get(node.name)
+            down[node.idx] = [0.0, 0.0] if obs is None else (
+                [INF, 0.0] if obs == PRESENT else [0.0, INF])
+            continue
+        costs = [0.0, 0.0]
+        for parent_state in (ABSENT, PRESENT):
+            costs[parent_state] = sum(
+                min(trans[parent_state][s] + down[c.idx][s] for s in (ABSENT, PRESENT))
+                for c in node.children)
+        down[node.idx] = costs
+
+    root = nodes_post[-1]
+    rc = down[root.idx]
+    best = min(rc)
+    ambiguous = set()
+    if rc[ABSENT] == rc[PRESENT]:
+        ambiguous.add(root.idx)
+        # Representative only. The root remains 'ambiguous' in all biological
+        # output fields. 'terminal' prefers the state that avoids an ancestral
+        # gap; 'ancestral' prefers PRESENT; 'none' uses ABSENT deterministically.
+        root_state = PRESENT if tie_break == 'ancestral' else ABSENT
+    else:
+        root_state = ABSENT if rc[ABSENT] < rc[PRESENT] else PRESENT
+
+    assign = {root.idx: root_state}
+    delta = {root.idx: abs(rc[PRESENT] - rc[ABSENT])}
+    for node in reversed(nodes_post):
+        if node.is_tip:
+            continue
+        pstate = assign[node.idx]
+        for child in node.children:
+            options = [(trans[pstate][s] + down[child.idx][s], s) for s in (ABSENT, PRESENT)]
+            lo = min(v for v, _ in options)
+            tied = [s for v, s in options if v == lo]
+            delta[child.idx] = abs(options[0][0] - options[1][0])
+            if len(tied) > 1:
+                ambiguous.add(child.idx)
+                if child.is_tip:
+                    chosen = pstate           # missing-data tip: representative inheritance
+                elif tie_break == "ancestral":
+                    chosen = PRESENT
+                elif tie_break == "terminal":
+                    chosen = pstate
+                else:
+                    chosen = pstate
+            else:
+                chosen = tied[0]
+            assign[child.idx] = chosen
+    return assign, best, ambiguous, delta
+
+
+# ---------------------------------------------------------------- characters
+
+def gap_runs(sequence, gap="-"):
+    """Maximal runs of gap in one sequence, as 1-based inclusive intervals."""
+    runs, start = [], None
+    for i, ch in enumerate(sequence, start=1):
+        if ch == gap:
+            if start is None:
+                start = i
+        elif start is not None:
+            runs.append((start, i - 1))
+            start = None
+    if start is not None:
+        runs.append((start, len(sequence)))
+    return runs
+
+
+def decompose_run(run, all_intervals, tolerance, _depth=0):
+    """Split a gap run into a shared core plus its lineage-specific extension.
+
+    Miniopterus australis carries 646-696 while natalensis and schreibersii
+    carry 646-687.  Scored as raw runs these are three different characters and
+    the shared 42 bp deletion disappears.  Scored as one 646-696 character the
+    other two look like they gained 9 nt back.  Both are wrong.
+
+    A run is therefore split against any OTHER observed run that it strictly
+    contains AND with which it shares a breakpoint: 646-696 shares its left
+    breakpoint with 646-687, so it becomes [646-687] + [688-696] - one shared
+    deletion plus one extension, which is what the alignment actually shows.
+
+    A contained run that shares NEITHER breakpoint is a separate, interior event
+    (Nycteris thebaica 661-669 inside the Miniopterus deletion) and must not
+    split anything.
+    """
+    start, end = run
+    if _depth > 64:
+        return [(start, end)]
+    best = None
+    for cs, ce in all_intervals:
+        if (cs, ce) == (start, end):
+            continue
+        if cs < start - tolerance or ce > end + tolerance:
+            continue                                   # must be contained
+        left = abs(cs - start) <= tolerance
+        right = abs(ce - end) <= tolerance
+        if left == right:                              # shares both, or neither
+            continue
+        if best is None or (ce - cs) > (best[1] - best[0]):
+            best = (cs, ce)
+    if best is None:
+        return [(start, end)]
+    cs, ce = best
+    out = [(cs, ce)]
+    if abs(cs - start) <= tolerance:                   # shared left -> residual right
+        if ce + 1 <= end:
+            out += decompose_run((ce + 1, end), all_intervals, tolerance, _depth + 1)
+    else:                                              # shared right -> residual left
+        if start <= cs - 1:
+            out += decompose_run((start, cs - 1), all_intervals, tolerance, _depth + 1)
+    return out
+
+
+def cluster_indel_characters(alignment, tips, tolerance):
+    """Group per-tip gap runs into breakpoint-defined characters.
+
+    Two runs join the same character when BOTH breakpoints agree to within
+    `tolerance` columns.  A run that shares only one breakpoint stays its own
+    character but the relationship is recorded, which is what distinguishes a
+    nested extension (Miniopterus australis 688-696 sharing a left breakpoint
+    with the shared 646-687 deletion) from an independent indel.
+    """
+    raw = {tip: gap_runs(alignment[tip]) for tip in tips}
+    all_intervals = sorted({r for runs in raw.values() for r in runs})
+    segments_by_tip = {}
+    for tip in tips:
+        segs = []
+        for run in raw[tip]:
+            segs.extend(decompose_run(run, all_intervals, tolerance))
+        segments_by_tip[tip] = sorted(set(segs))
+
+    observed = [{"tip": tip, "start": s, "end": e}
+                for tip in tips for s, e in segments_by_tip[tip]]
+
+    clusters = []
+    for run in sorted(observed, key=lambda r: (r["start"], r["end"], r["tip"])):
+        for cluster in clusters:
+            if (abs(cluster["start"] - run["start"]) <= tolerance
+                    and abs(cluster["end"] - run["end"]) <= tolerance):
+                cluster["tips"].add(run["tip"])
+                cluster["members"].append(run)
+                cluster["start"] = min(cluster["start"], run["start"])
+                cluster["end"] = max(cluster["end"], run["end"])
+                break
+        else:
+            clusters.append({"start": run["start"], "end": run["end"],
+                             "tips": {run["tip"]}, "members": [run]})
+    clusters.sort(key=lambda c: (c["start"], c["end"]))
+    return clusters, segments_by_tip, raw
+
+
+def breakpoint_relationships(clusters, tolerance):
+    """Describe how each character relates to overlapping ones."""
+    notes = defaultdict(list)
+    for i, a in enumerate(clusters):
+        for j, b in enumerate(clusters):
+            if i == j:
+                continue
+            if b["end"] < a["start"] or b["start"] > a["end"]:
+                continue
+            same_start = abs(a["start"] - b["start"]) <= tolerance
+            same_end = abs(a["end"] - b["end"]) <= tolerance
+            if same_start and not same_end:
+                kind = "shares_left_breakpoint_with"
+            elif same_end and not same_start:
+                kind = "shares_right_breakpoint_with"
+            elif a["start"] <= b["start"] and a["end"] >= b["end"]:
+                kind = "contains"
+            elif a["start"] >= b["start"] and a["end"] <= b["end"]:
+                kind = "nested_within"
+            else:
+                kind = "overlaps"
+            notes[i].append(f"{kind}:IND{j + 1:04d}({b['start']}-{b['end']})")
+    return notes
+
+
+def indel_tip_states(alignment, tips, segments_by_tip, raw_runs, start, end, tolerance):
+    """Score one breakpoint-defined indel character across the tips.
+
+    This is complex indel coding, and the inapplicable case is the important
+    one. A tip is PRESENT only when one of its OWN decomposed gap runs matches
+    this character's breakpoints. If the entire character is gap in that tip
+    only because a DIFFERENT larger deletion spans it, the state is UNKNOWN.
+    If even one known residue occurs within the character, the full gap event is
+    ABSENT -- so a smaller interior deletion does not make the taxon unknown for
+    a larger character. On GUCA1B this makes Nycteris (661-669 deletion) ABSENT
+    for the Miniopterus 646-687 event, while Miniopterus remain UNKNOWN for the
+    smaller Nycteris character because their larger deletion spans all of it.
+    """
+    states = {}
+    for tip in tips:
+        matched = any(abs(s - start) <= tolerance and abs(e - end) <= tolerance
+                      for s, e in segments_by_tip[tip])
+        if matched:
+            states[tip] = PRESENT
+            continue
+        seg = alignment[tip][start - 1:end]
+        # A residue anywhere inside the character proves that this tip does NOT
+        # carry the full breakpoint-defined gap event, even if it has a smaller
+        # independent gap nested inside it. This is essential for GUCA1B:
+        # Nycteris 661-669 is ABSENT for the larger Miniopterus 646-687 event.
+        # Conversely, if the whole character is gap because a different larger
+        # deletion spans it, the state is inapplicable/UNKNOWN rather than a
+        # false carrier of the smaller event.
+        if seg and any(c in ACGT for c in seg):
+            states[tip] = ABSENT
+        else:
+            states[tip] = None
+    return states
+
+
+def stop_mask_characters(masked_stops, alignment, tips):
+    """One character per exact mapped premature-STOP allele.
+
+    Different STOP codons at the same aligned position are separate mutational
+    characters. Raw STOPs whose MACSE frame phase is still shifted at that exact
+    position are retained in diagnostics but are not reconstructed as independent
+    nonsense mutations. A STOP downstream of compensated frameshifts (net MACSE
+    frame correction mod 3 == 0) remains eligible as an independent event.
+    """
+    groups = defaultdict(set)
+    alleles_at_span = defaultdict(dict)
+    for row in masked_stops:
+        if not trueish(row.get("pseudogenizing_event_candidate")):
+            continue
+        if "independent_stop_candidate" in row and not trueish(row.get("independent_stop_candidate")):
+            continue
+        start = safe_int(row.get("primary_alignment_start"))
+        end = safe_int(row.get("primary_alignment_end"))
+        species = row.get("species", "")
+        codon = str(row.get("stop_codon", "")).upper()
+        if start is None or end is None or not species or codon not in {"TAA", "TAG", "TGA"}:
+            continue
+        groups[(start, end, codon)].add(species)
+        alleles_at_span[(start, end)][species] = codon
+
+    characters = []
+    for (start, end, codon), carriers in sorted(groups.items()):
+        states = {}
+        for tip in tips:
+            seg = alignment[tip][start - 1:end].upper()
+            if tip in carriers:
+                states[tip] = PRESENT
+            elif tip in alleles_at_span[(start, end)]:
+                states[tip] = ABSENT  # another STOP allele is a different mutation
+            elif seg and seg == codon:
+                # This tip's own raw-sequence premature-stop scan did not
+                # register this exact occurrence as an independent candidate
+                # (e.g. upstream frameshift bookkeeping in ITS raw coordinates
+                # routed it through the generic "mask any stop before writing
+                # the PAML-safe alignment" catch-all instead). The canonical
+                # alignment is the authoritative coordinate system this
+                # character's (start, end, codon) are defined in; if this
+                # tip's own column segment there is the exact same stop
+                # allele as the character it is being compared against, it
+                # carries that character -- the per-species classification
+                # gate above only decides whether an occurrence is reliable
+                # enough to *found* a shared character, not whether some
+                # other tip carries an already-established one.
+                states[tip] = PRESENT
+            elif seg and all(c in ACGT for c in seg):
+                states[tip] = ABSENT
+            else:
+                states[tip] = None
+        carriers_observed = set(carriers) | {t for t, s in states.items() if s == PRESENT}
+        characters.append({"start": start, "end": end, "stop_codon": codon,
+                           "tips": carriers_observed, "states": states})
+    return characters
+
+
+# ---------------------------------------------------------------- main
+
+EVENT_HEADER = [
+    "gene", "event_id", "character_class", "event_type", "biological_interpretation",
+    "alignment_start", "alignment_end", "event_length", "length_mod_3", "frame_effect",
+    "origin_node", "origin_is_tip", "parent_node", "branch",
+    "shared_event", "n_affected_tips", "affected_tips",
+    "reversal_below_origin", "secondary_changes_below_origin",
+    "root_state", "parsimony_score", "delta_parsimony_support", "ambiguous_origin", "direction_confident",
+    "parent_age", "child_age", "age_interval",
+    "n_observed_present", "n_observed_absent", "n_unknown",
+    "observed_present_tips", "breakpoint_relationships", "coordinate_system",
+]
+
+CHAR_HEADER = [
+    "gene", "character_id", "character_class", "alignment_start", "alignment_end",
+    "character_length", "length_mod_3", "n_member_runs", "member_breakpoints",
+    "n_observed_present", "n_observed_absent", "n_unknown", "root_state",
+    "parsimony_score", "n_gains", "n_losses", "ambiguous_nodes", "history_ambiguous", "stop_codon",
+    "breakpoint_relationships",
+]
+
+STATE_HEADER = ["gene", "character_id", "character_class", "node_label", "node_type", "state",
+                "representative_state", "delta_parsimony_support", "ambiguous_at_node"]
+
+FRAME_HEADER = ["gene", "node_label", "node_type", "net_indel_bp",
+                "signed_net_length_change_from_root", "frame_shifted_by", "frame_offset_from_root",
+                "frame_disrupted_provisional", "frame_currently_shifted",
+                "frameshifting_events_in_history", "structural_state_ambiguous",
+                "n_frameshift_indels_present", "n_stop_masks_present", "premature_stop_present",
+                "frameshift_indel_ids", "stop_mask_ids"]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Breakpoint-coded indel/mask events placed on the dated tree by parsimony.")
+    parser.add_argument("--gene", required=True)
+    parser.add_argument("--alignment", required=True,
+                        help="NATIVE primary alignment (MACSE '!' rendered as '-')")
+    parser.add_argument("--tree", required=True, help="Pruned dated tree")
+    parser.add_argument("--masked-stops", default=None,
+                        help="Step 01/02 masked in-frame STOP records (optional)")
+    parser.add_argument("--outdir", required=True)
+    parser.add_argument("--dated", choices=["yes", "no"], default="yes")
+    parser.add_argument("--gain-cost", type=float, default=1.0)
+    parser.add_argument("--loss-cost", type=float, default=1.0)
+    parser.add_argument("--tie-break", choices=["none", "ancestral", "terminal"], default="none",
+                        help="Representative history for exact ties; ambiguity is always retained in output.")
+    parser.add_argument("--breakpoint-tolerance", type=int, default=0,
+                        help="Columns of slack when clustering indel breakpoints. "
+                             "Start at 0 so real alignment disagreement is visible.")
+    parser.add_argument("--min-carriers", type=int, default=2)
+    parser.add_argument("--coordinate-system", default="primary_codon_alignment")
+    args = parser.parse_args()
+
+    if args.gain_cost <= 0 or args.loss_cost <= 0:
+        raise SystemExit("--gain-cost and --loss-cost must be positive")
+    if args.breakpoint_tolerance < 0:
+        raise SystemExit("--breakpoint-tolerance must be >= 0")
+
+    gene = args.gene
+    dated = args.dated == "yes"
+    out = Path(args.outdir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    alignment, _order, aln_len = read_fasta(args.alignment)
+    root = parse_newick(args.tree)
+    root, collapsed = collapse_unifurcations(root)
+    root, original_labels = apply_pensieve_labels(root)
+    nodes_post = list(iter_nodes(root, "postorder"))
+    tips = [n.name for n in nodes_post if n.is_tip]
+    parent_of = {c.name: n.name for n in iter_nodes(root, "preorder") for c in n.children}
+
+    missing = sorted(set(tips) - set(alignment))
+    if missing:
+        raise SystemExit(f"{len(missing)} tree tip(s) absent from the alignment: {missing[:10]}")
+    extra = sorted(set(alignment) - set(tips))
+
+    ages = node_ages(root, dated)
+    write_newick(root, out / f"03_{gene}.pensieve_labelled_dated_tree.nwk")
+    label_map_rows = []
+    for node in nodes_post:
+        if node.is_tip:
+            continue
+        desc = sorted(t.name for t in iter_nodes(node, "preorder") if t.is_tip)
+        label_map_rows.append({
+            "gene": gene,
+            "pensieve_node_label": node.name,
+            "original_tree_label": original_labels.get(node.name, "NA"),
+            "descendant_tip_count": len(desc),
+            "descendant_tips": ",".join(desc),
+            "rooted_descendant_tip_key": "|".join(desc),
+            "node_age": ages.get(node.name, "NA"),
+        })
+    write_tsv(label_map_rows, out / f"03_{gene}.internode_label_map.tsv",
+              ["gene", "pensieve_node_label", "original_tree_label",
+               "descendant_tip_count", "descendant_tips",
+               "rooted_descendant_tip_key", "node_age"])
+
+    print(f"[info] {gene}: {len(tips)} tips, {len(nodes_post) - len(tips)} internal nodes, "
+          f"alignment {aln_len} columns")
+    if collapsed:
+        print(f"[info] collapsed {len(collapsed)} degree-2 node(s)")
+    if extra:
+        print(f"[info] {len(extra)} alignment record(s) are not tree tips and were ignored")
+    print(f"[info] parsimony gain={args.gain_cost:g} loss={args.loss_cost:g} "
+          f"tie-break={args.tie_break} breakpoint-tolerance={args.breakpoint_tolerance}")
+
+    # ---- build characters
+    clusters, segments_by_tip, raw_runs = cluster_indel_characters(
+        alignment, tips, args.breakpoint_tolerance)
+    relationships = breakpoint_relationships(clusters, args.breakpoint_tolerance)
+    characters = []
+    for i, cluster in enumerate(clusters, start=1):
+        characters.append({
+            "id": f"IND{i:04d}",
+            "klass": "indel",
+            "start": cluster["start"],
+            "end": cluster["end"],
+            "states": indel_tip_states(alignment, tips, segments_by_tip, raw_runs,
+                                       cluster["start"], cluster["end"],
+                                       args.breakpoint_tolerance),
+            "stop_codon": "NA",
+            "members": cluster["members"],
+            "relationships": ";".join(relationships.get(i - 1, [])) or "NA",
+        })
+
+    masked_stops = read_tsv(args.masked_stops) if args.masked_stops else []
+    for i, character in enumerate(stop_mask_characters(masked_stops, alignment, tips), start=1):
+        characters.append({
+            "id": f"STOP{i:04d}",
+            "klass": "stop_mask",
+            "start": character["start"],
+            "end": character["end"],
+            "states": character["states"],
+            "stop_codon": character.get("stop_codon", "NA"),
+            "members": [],
+            "relationships": "NA",
+        })
+
+    print(f"[info] characters: {sum(1 for c in characters if c['klass'] == 'indel')} indel, "
+          f"{sum(1 for c in characters if c['klass'] == 'stop_mask')} stop-mask")
+
+    # ---- reconstruct
+    event_rows, char_rows, state_rows = [], [], []
+    present_at = defaultdict(set)          # node -> set of character ids
+    event_counter = 0
+
+    for character in characters:
+        states = character["states"]
+        if not any(v == PRESENT for v in states.values()):
+            continue
+        assign, score, ambiguous, delta = sankoff(
+            nodes_post, states, args.gain_cost, args.loss_cost, args.tie_break)
+        root_state = assign[root.idx]
+        length = character["end"] - character["start"] + 1
+
+        for node in nodes_post:
+            is_ambiguous = node.idx in ambiguous
+            if assign[node.idx] == PRESENT and not is_ambiguous:
+                present_at[node.name].add(character["id"])
+            if is_ambiguous:
+                state_label = "ambiguous"
+            elif character["klass"] == "indel":
+                state_label = "gap" if assign[node.idx] == PRESENT else "residue"
+            else:
+                state_label = "stop_present" if assign[node.idx] == PRESENT else "stop_absent"
+            state_rows.append({
+                "gene": gene, "character_id": character["id"], "character_class": character["klass"],
+                "node_label": node.name,
+                "node_type": "tip" if node.is_tip else ("root" if node is root else "internal"),
+                "state": state_label,
+                "representative_state": "present" if assign[node.idx] == PRESENT else "absent",
+                "delta_parsimony_support": format(delta.get(node.idx, 0.0), "g"),
+                "ambiguous_at_node": is_ambiguous,
+            })
+
+        transitions = []
+        for node in iter_nodes(root, "preorder"):
+            if node.parent is None:
+                continue
+            if assign[node.parent.idx] == assign[node.idx]:
+                continue
+            transitions.append((node, "gain" if assign[node.idx] == PRESENT else "loss"))
+
+        present_tips = {t for t, v in states.items() if v == PRESENT}
+        absent_tips = {t for t, v in states.items() if v == ABSENT}
+        unknown_tips = [t for t, v in states.items() if v is None]
+
+        for node, kind in transitions:
+            event_counter += 1
+            subtree_tips = {t.name for t in iter_nodes(node, "preorder") if t.is_tip}
+            # For a gain the affected tips carry the state; for a loss (a gap
+            # lost = insertion/restoration) they are the ones that do NOT.
+            affected = sorted((present_tips if kind == "gain" else absent_tips) & subtree_tips)
+            secondary = [f"{n2.parent.name}->{n2.name}:{k2}"
+                         for n2, k2 in transitions
+                         if n2 is not node and n2.name in
+                         {x.name for x in iter_nodes(node, "preorder")}]
+            # Only ambiguity that can alter this branch transition/polarity
+            # makes the event direction non-authoritative.  An unrelated
+            # missing-data tie elsewhere in the tree is retained in the
+            # character diagnostics but must not downgrade a clear origin.
+            history_ambiguous = (
+                root.idx in ambiguous or node.idx in ambiguous or node.parent.idx in ambiguous
+            )
+            direction_confident = not history_ambiguous
+            if not direction_confident:
+                interpretation = ("ambiguous_indel_change" if character["klass"] == "indel"
+                                  else "ambiguous_stop_change")
+            else:
+                interpretation = (
+                    ("deletion" if kind == "gain" else "insertion_or_restoration")
+                    if character["klass"] == "indel"
+                    else ("premature_stop_gained" if kind == "gain"
+                          else "premature_stop_lost"))
+            event_rows.append({
+                "gene": gene,
+                "event_id": f"{gene}|{character['id']}|{kind}{event_counter:04d}",
+                "character_class": character["klass"],
+                "event_type": f"{character['klass']}_{kind}",
+                "biological_interpretation": interpretation,
+                "alignment_start": character["start"],
+                "alignment_end": character["end"],
+                "event_length": length,
+                "length_mod_3": length % 3,
+                "frame_effect": ("in_frame" if length % 3 == 0 else "frameshift")
+                                if character["klass"] == "indel" else "NA",
+                "origin_node": node.name,
+                "origin_is_tip": node.is_tip,
+                "parent_node": node.parent.name,
+                "branch": f"{node.parent.name}->{node.name}",
+                "shared_event": (not node.is_tip) and len(affected) >= args.min_carriers,
+                "n_affected_tips": len(affected),
+                "affected_tips": ",".join(affected) or "NA",
+                "reversal_below_origin": len(affected) < len(subtree_tips),
+                "secondary_changes_below_origin": ";".join(secondary) or "NA",
+                "root_state": "ambiguous" if root.idx in ambiguous else ("present" if root_state == PRESENT else "absent"),
+                "parsimony_score": format(score, "g"),
+                "delta_parsimony_support": format(delta.get(node.idx, 0.0), "g"),
+                "ambiguous_origin": history_ambiguous or node.idx in ambiguous or node.parent.idx in ambiguous,
+                "direction_confident": direction_confident,
+                "parent_age": ages.get(node.parent.name, "NA"),
+                "child_age": ages.get(node.name, "NA"),
+                "age_interval": (f"{ages.get(node.parent.name)}-{ages.get(node.name)}"
+                                 if dated else "NA"),
+                "n_observed_present": len(present_tips),
+                "n_observed_absent": len(absent_tips),
+                "n_unknown": len(unknown_tips),
+                "observed_present_tips": ",".join(sorted(present_tips)) or "NA",
+                "breakpoint_relationships": character["relationships"],
+                "coordinate_system": args.coordinate_system,
+            })
+
+        char_rows.append({
+            "gene": gene, "character_id": character["id"],
+            "character_class": character["klass"],
+            "alignment_start": character["start"], "alignment_end": character["end"],
+            "character_length": length, "length_mod_3": length % 3,
+            "n_member_runs": len(character["members"]),
+            "member_breakpoints": ";".join(
+                sorted({f"{m['start']}-{m['end']}" for m in character["members"]})) or "NA",
+            "n_observed_present": len(present_tips),
+            "n_observed_absent": len(absent_tips),
+            "n_unknown": len(unknown_tips),
+            "root_state": "ambiguous" if root.idx in ambiguous else ("present" if root_state == PRESENT else "absent"),
+            "parsimony_score": format(score, "g"),
+            "n_gains": sum(1 for _, k in transitions if k == "gain"),
+            "n_losses": sum(1 for _, k in transitions if k == "loss"),
+            "ambiguous_nodes": ",".join(sorted(
+                n.name for n in nodes_post if n.idx in ambiguous)) or "NA",
+            "history_ambiguous": bool(ambiguous),
+            "stop_codon": character.get("stop_codon", "NA"),
+            "breakpoint_relationships": character["relationships"],
+        })
+
+    # ---- signed frame arithmetic: no ancestral nucleotide ASR required
+    char_by_id = {c["id"]: c for c in characters}
+    event_by_branch = defaultdict(list)
+    for row in event_rows:
+        event_by_branch[row["branch"]].append(row)
+
+    frame_rows = []
+    cumulative_delta = {root.name: 0}
+    cumulative_frameshift_history = {root.name: 0}
+    structural_ambiguous = {root.name: any(
+        r["node_label"] == root.name and trueish(r["ambiguous_at_node"]) for r in state_rows
+    )}
+    for node in iter_nodes(root, "preorder"):
+        if node.parent is not None:
+            parent = node.parent.name
+            branch = f"{parent}->{node.name}"
+            delta_bp = 0
+            fs_events = 0
+            branch_ambiguous = False
+            for ev in event_by_branch.get(branch, []):
+                if ev["character_class"] != "indel":
+                    continue
+                if not trueish(ev.get("direction_confident")):
+                    branch_ambiguous = True
+                    continue
+                length = int(ev["event_length"])
+                if ev["biological_interpretation"] == "deletion":
+                    delta_bp -= length
+                elif ev["biological_interpretation"] == "insertion_or_restoration":
+                    delta_bp += length
+                if length % 3 != 0:
+                    fs_events += 1
+            cumulative_delta[node.name] = cumulative_delta[parent] + delta_bp
+            cumulative_frameshift_history[node.name] = cumulative_frameshift_history[parent] + fs_events
+            node_ambig = any(r["node_label"] == node.name and trueish(r["ambiguous_at_node"]) for r in state_rows)
+            structural_ambiguous[node.name] = structural_ambiguous[parent] or branch_ambiguous or node_ambig
+
+        ids = sorted(present_at.get(node.name, set()))
+        indel_ids = [i for i in ids if char_by_id[i]["klass"] == "indel"]
+        stop_ids = [i for i in ids if char_by_id[i]["klass"] == "stop_mask"]
+        shifty = [i for i in indel_ids
+                  if (char_by_id[i]["end"] - char_by_id[i]["start"] + 1) % 3]
+        net = cumulative_delta.get(node.name, 0)
+        offset = net % 3
+        frame_rows.append({
+            "gene": gene, "node_label": node.name,
+            "node_type": "tip" if node.is_tip else ("root" if node is root else "internal"),
+            "net_indel_bp": net,
+            "signed_net_length_change_from_root": net,
+            "frame_shifted_by": offset,
+            "frame_offset_from_root": offset,
+            "frame_disrupted_provisional": offset != 0,
+            "frame_currently_shifted": offset != 0,
+            "frameshifting_events_in_history": cumulative_frameshift_history.get(node.name, 0),
+            "structural_state_ambiguous": structural_ambiguous.get(node.name, False),
+            "n_frameshift_indels_present": len(shifty),
+            "n_stop_masks_present": len(stop_ids),
+            "premature_stop_present": bool(stop_ids),
+            "frameshift_indel_ids": ",".join(shifty) or "NA",
+            "stop_mask_ids": ",".join(stop_ids) or "NA",
+        })
+
+    write_tsv(event_rows, out / f"03_{gene}.alignment_events.tsv", EVENT_HEADER)
+    write_tsv(char_rows, out / f"03_{gene}.alignment_characters.tsv", CHAR_HEADER)
+    write_tsv(state_rows, out / f"03_{gene}.alignment_character_node_states.tsv", STATE_HEADER)
+    write_tsv(frame_rows, out / f"03_{gene}.frame_arithmetic_by_node.tsv", FRAME_HEADER)
+
+    shared = [r for r in event_rows if r["shared_event"]]
+    ties = [r for r in event_rows if trueish(r["ambiguous_origin"])]
+    print(f"[result] {len(event_rows)} events on {len({r['branch'] for r in event_rows})} branches; "
+          f"{len(shared)} shared; {len(ties)} with an exact parsimony tie")
+    for row in sorted(shared, key=lambda r: (-int(r["event_length"]), int(r["alignment_start"])))[:15]:
+        print(f"   {row['biological_interpretation']:<24} {row['alignment_start']}-{row['alignment_end']} "
+              f"({row['event_length']} bp)  {row['branch']}  affects {row['n_affected_tips']}")
+    print(f"[done] {out}")
+
+
+if __name__ == "__main__":
+    main()
