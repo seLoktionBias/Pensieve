@@ -29,7 +29,7 @@ Pick whichever matches where you're running Pensieve. Both end with the same `Pe
 **Local machine (Mac/Linux, conda or mamba already on `PATH`)**
 
 ```bash
-git clone <this-repository-url> Pensieve
+git clone git@github.com:seLoktionBias/Pensieve.git Pensieve
 cd Pensieve
 bash install.sh
 ```
