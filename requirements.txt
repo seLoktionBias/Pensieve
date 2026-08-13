@@ -1,0 +1,51 @@
+Pensieve v3.31 requirements / environment notes
+===============================================
+
+Installation model
+------------------
+Pensieve no longer assumes mamba, conda, Miniforge, or an HPC module system.
+Choose the installation method that matches the machine:
+
+  bash install.sh                         # auto: mamba, then conda
+  bash install.sh --backend=mamba
+  bash install.sh --backend=conda
+  bash install.sh --backend=staged        # lower solver pressure
+  bash install.sh --backend=venv          # Python venv only
+  bash install.sh --backend=current       # current Python; creates no env
+
+The venv/current modes install only Python dependencies from requirements-pip.txt.
+For those modes, MACSE, codeml/PAML and R/Rscript must be supplied separately by
+the operating system, a module system, a container, or another package manager.
+Pensieve itself never runs a site-specific command such as `ml miniforge`.
+
+Core v3.31 runtime
+------------------
+Python 3.11-compatible runtime
+biopython
+paml / codeml
+macse
+R with ape and ggplot2 for plotting
+
+Python-only requirements
+------------------------
+See requirements-pip.txt for numpy, scipy, pandas, biopython and ete3. This file
+supports the venv/current installer backends and intentionally excludes external
+scientific executables that pip cannot provide reliably.
+
+Optional concordance runtime
+----------------------------
+IndelMaP plus its Python dependencies. IndelMaP is optional and never supplies
+the authoritative ancestral structural state.
+
+Retained compatibility packages
+-------------------------------
+environment.yml still includes IQ-TREE, MUSCLE, EMBOSS and several historical
+packages for compatibility with older Pensieve environments. v3.31 does not call
+IQ-TREE or MUSCLE in its core inference workflow.
+
+Key codeml settings
+-------------------
+clock = 0
+fix_blength = 0
+RateAncestor = 1
+cleandata = 0

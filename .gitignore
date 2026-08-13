@@ -1,0 +1,21 @@
+# IndelMaP is a third-party dependency install.sh clones fresh for each user;
+# it is not part of the Pensieve package itself.
+external/indelMaP/
+
+# Local run output -- not part of the distributed package.
+results_00/
+results_01/
+results_02/
+results_03/
+final_results/
+*.dated_tree_used.nwk
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors / OS
+.DS_Store
+
+# Python venv created by install.sh --backend=venv
+.venv/

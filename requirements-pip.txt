@@ -1,0 +1,8 @@
+# Python-only dependencies for Pensieve when using --backend=venv or --backend=current.
+# External scientific executables (MACSE, codeml/PAML, R/Rscript) are not pip packages
+# and must already be available on PATH for a full Pensieve run.
+numpy
+scipy
+pandas
+biopython
+ete3

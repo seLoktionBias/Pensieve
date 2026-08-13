@@ -1,0 +1,27 @@
+name: Pensieve
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  - python=3.11.15
+  - pip
+  - git
+  - numpy
+  - scipy
+  - pandas
+  - biopython
+  - ete3
+  - iqtree
+  - paml
+  - macse
+  - muscle
+  - emboss
+  - r-base
+  - r-ape
+  - r-ggplot2
+  - r-dplyr
+  - r-readr
+  - r-stringr
+  - r-tidyr
+  - r-optparse

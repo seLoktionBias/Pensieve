@@ -1,0 +1,650 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+STEP_ORDER = {
+    "diagnostics": 1,
+    "alignment": 2,
+    "events": 3,
+    "asr": 4,
+    "integrate": 5,
+    "plot": 6,
+}
+STEP_ALIASES = {
+    "auto": "AUTO", "AUTO": "AUTO", "full": "FULL", "FULL": "FULL",
+    "diagnostics": "diagnostics", "indel_discovery": "diagnostics", "indel-discovery": "diagnostics",
+    "macse": "diagnostics", "MACSE": "diagnostics",
+    "alignment": "alignment", "msa": "alignment", "MSA": "alignment",
+    "events": "events", "event": "events", "binary": "events",
+    "asr": "asr", "ASR": "asr", "omega": "asr", "paml": "asr", "PAML": "asr",
+    "integrate": "integrate", "integration": "integrate",
+    "plot": "plot", "R": "plot", "r": "plot",
+}
+
+
+def normalise_step(value: str, *, for_from: bool, skip_plot: bool = False) -> str:
+    if value is None:
+        value = "AUTO" if for_from else "FULL"
+    if value not in STEP_ALIASES:
+        allowed = ", ".join(["AUTO", "FULL", "diagnostics", "alignment", "events", "asr", "integrate", "plot"])
+        raise argparse.ArgumentTypeError(f"unknown step '{value}'. Allowed values: {allowed}")
+    step = STEP_ALIASES[value]
+    if step in {"AUTO", "FULL"}:
+        return "diagnostics" if for_from else ("integrate" if skip_plot else "plot")
+    return step
+
+
+def find_default_fasta(gene: str, cwd: Path):
+    for name in (f"{gene}.fasta", f"{gene}.fas", f"{gene}.fa", f"{gene}.fna"):
+        path = cwd / name
+        if path.exists():
+            return path
+    hits = []
+    for pattern in ("*.fasta", "*.fas", "*.fa", "*.fna"):
+        hits.extend(path for path in cwd.glob(pattern) if gene.lower() in path.name.lower())
+    return hits[0] if len(hits) == 1 else None
+
+
+def find_default_tree(cwd: Path):
+    for name in ("dated_tree.nwk", "dated_tree.tre", "tree.nwk", "tree.tre"):
+        path = cwd / name
+        if path.exists():
+            return path
+    return None
+
+
+try:
+    import signal
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except (ImportError, AttributeError, ValueError):
+    pass
+
+
+def shell_join(items):
+    return " ".join(shlex.quote(str(item)) for item in items)
+
+
+def environment_command(base_cmd, env_mode: str, env_name: str, venv_path: Path):
+    """Return an execution command without shell-specific conda activation.
+
+    `inherit` is deliberately the default: local runs and Slurm jobs use the
+    environment/PATH of the process that launched Pensieve. Explicit conda or
+    mamba modes use `<manager> run -n`, which works in non-interactive shells
+    without `conda activate`/`mamba activate`. A Python venv is sourced through
+    a small bash wrapper because the pipeline also launches shell/R executables.
+    """
+    if env_mode == "inherit":
+        return list(base_cmd)
+    if env_mode in {"conda", "mamba"}:
+        return [env_mode, "run", "-n", env_name] + list(base_cmd)
+    if env_mode == "venv":
+        activate = venv_path / "bin" / "activate"
+        return ["bash", "-lc", f"source {shlex.quote(str(activate))} && exec {shell_join(base_cmd)}"]
+    raise ValueError(f"unsupported env mode: {env_mode}")
+
+
+def resolve_paml_dat_dir(root: Path, env_mode: str, env_name: str, venv_path: Path, dry_run: bool) -> Path:
+    """Locate PAML's own dat/ directory next to wherever codeml actually
+    resolves for the chosen --env-mode, e.g. <conda/mamba env prefix>/dat,
+    installed there by the bioconda paml package alongside codeml itself. No
+    path is ever hard-coded to a specific machine/user.
+
+    Pensieve's codon-model control file (templates/dummy_codon_asr.ctl) does
+    not currently read any file from this directory -- it has no aaRatefile/
+    empirical amino-acid model setting -- so this is forward/CLI compatibility
+    (see dat/README.md), not a required input for a run to succeed. Falls back
+    to Pensieve's own placeholder dat/ when codeml cannot be resolved this way
+    (including whenever --dry-run is set, so dry runs never shell out).
+    """
+    fallback = root / "dat"
+    if dry_run:
+        return fallback
+    codeml_path = None
+    try:
+        if env_mode in {"conda", "mamba"} and shutil.which(env_mode):
+            probe = subprocess.run(
+                [env_mode, "run", "-n", env_name, "python3", "-c",
+                 "import shutil; print(shutil.which('codeml') or '')"],
+                capture_output=True, text=True, timeout=30,
+            )
+            lines = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
+            codeml_path = lines[-1] if lines else None
+        elif env_mode == "venv":
+            candidate = venv_path / "bin" / "codeml"
+            codeml_path = str(candidate) if candidate.exists() else shutil.which("codeml")
+        else:
+            codeml_path = shutil.which("codeml")
+    except (OSError, subprocess.SubprocessError):
+        codeml_path = None
+    if codeml_path:
+        candidate_dir = Path(codeml_path).resolve().parent.parent / "dat"
+        if candidate_dir.is_dir():
+            return candidate_dir
+    return fallback
+
+
+def print_short_help():
+    print(textwrap.dedent("""\
+    Pensieve: reconstruct branch-resolved pseudogenization histories
+
+    Usage:
+      pensieve --gene GENE --fasta GENE.fasta --tree dated_tree.nwk --workdir GENE_run
+
+    Common runs:
+      Full local run
+        pensieve --gene CNGA3 --fasta CNGA3.fasta --tree dated_tree.nwk --workdir CNGA3_run
+
+      Use a manually curated codon alignment (its columns are authoritative)
+        pensieve --gene CNGA3 --fasta CNGA3.aln.fasta --tree dated_tree.nwk \\
+                 --alignment defined --workdir CNGA3_run
+
+      Stop after event reconstruction for manual inspection
+        pensieve --gene GUCA1B --fasta GUCA1B.fasta --tree dated_tree.nwk \\
+                 --run_up_to events --workdir GUCA1B_run
+
+      Resume at codeml ASR after inspecting events
+        pensieve --gene GUCA1B --fasta GUCA1B.fasta --tree dated_tree.nwk \\
+                 --run_from_step asr --workdir GUCA1B_run
+
+    Key options:
+      --gene NAME              gene name used in outputs and figures
+      --fasta FILE             CDS FASTA, or codon alignment with --alignment defined
+      --tree FILE              rooted species tree; pruned to shared taxa
+      --alignment perform|defined
+      --dated yes|no           input branch lengths are dates/times for plotting (default yes)
+      --mode local|slurm       run locally or submit the whole workflow to Slurm
+      --env-mode MODE          inherit|conda|mamba|venv (default inherit)
+      --env-name NAME          conda/mamba env name (default Pensieve)
+      --indelmap auto|yes|no   independent indel concordance layer (default auto)
+      --tie-break none|ancestral|terminal
+      --run_from_step STEP     diagnostics|alignment|events|asr|integrate|plot
+      --run_up_to STEP         diagnostics|alignment|events|asr|integrate|plot
+      --clean                  remove outputs from the starting stage onward
+
+    Help:
+      pensieve -h | -help | --help            this summary
+      pensieve --help -long                   full manual
+      pensieve --help --long                  full manual
+    """))
+
+
+def print_long_help():
+    print(textwrap.dedent("""\
+    ===========================================================================
+    Pensieve v3.37 - full manual
+    ===========================================================================
+
+    PURPOSE
+      Pensieve reconstructs where candidate coding-sequence lesions arose on a
+      rooted species tree and integrates that structural history with codeml
+      ancestral nucleotide reconstruction. Its central outputs distinguish:
+        (1) alignment/event evidence,
+        (2) substitution ASR evidence,
+        (3) reconstructed native ancestral CDS/ORF state, and
+        (4) inherited pseudogenic history.
+
+      Pensieve does not interpret a compensatory frameshift as proof that a
+      pseudogenized gene became functional again, and it does not silently force
+      exact parsimony ties into a confident insertion/deletion history.
+
+      Pensieve is entirely reference-free. No species or sequence is selected as
+      a reference for alignment, event discovery, coordinates, polarity, ASR or
+      plotting. Every reported lesion coordinate is 1-based/inclusive in the
+      canonical alignment, and that exact alignment is copied to final_results.
+
+      All inspectable sequence FASTAs are ordered by the rooted user phylogeny,
+      never alphabetically. Tip-only MSAs follow left-to-right terminal order;
+      combined tip+internode MSAs use depth-first preorder so each ancestor is
+      immediately followed by its descendant clade. Row ordering never changes
+      alignment columns or coordinate numbering.
+
+    ---------------------------------------------------------------------------
+    PIPELINE
+    ---------------------------------------------------------------------------
+      diagnostics
+        00  Reconcile taxa and audit each raw CDS. Missing a terminal stop codon
+            is NOT a reason to call an ORF incomplete. Internal in-frame stops,
+            start state, length modulo 3 and ambiguity are retained.
+        01  Run MACSE across the homologous sequence set for frameshift-aware
+            diagnosis/alignment. MACSE '!' is treated as a partial-codon
+            placeholder, not intrinsically as a 1-bp deletion.
+
+      alignment
+        02  Establish exactly one canonical coordinate system.
+            --alignment perform:
+                MACSE nucleotide alignment is canonical; no second MUSCLE
+                realignment is created.
+            --alignment defined:
+                the supplied codon alignment is authoritative; Pensieve never
+                inserts/deletes/rebuilds columns. FASTA records are reordered
+                only to follow the rooted tree for manual inspection.
+
+            Two synchronized views of those same columns are written:
+              02_<gene>.primary_codon_alignment_native.fasta
+                  biological/structural view; MACSE '!' placeholders removed
+                  as gaps, observed stop alleles retained.
+              02_<gene>.primary_codon_alignment.fasta
+                  codeml-safe view; frameshift placeholders -> N and exact stop
+                  codons -> NNN.
+
+            Raw premature-stop diagnoses are mapped into canonical alignment
+            coordinates before masking. STOP classification uses the cumulative
+            upstream MACSE frame correction modulo 3 at that exact STOP: a
+            non-zero phase is treated as a likely frameshift consequence, while
+            a compensated/restored phase (0 mod 3) remains eligible as an
+            independent nonsense mutation.
+
+      events
+        03  Reconstruct alignment characters before any ancestral-sequence
+            integration.
+            * Maximal gap runs are decomposed by shared breakpoints. This keeps
+              a shared core deletion plus a lineage-specific extension separate
+              and prevents an unrelated interior deletion from splitting it.
+            * Gap/residue is reconstructed with equal-cost Sankoff parsimony on
+              the rooted user tree.
+            * Exact ties remain biologically AMBIGUOUS. --tie-break can select
+              a representative display history but never removes the ambiguity
+              flag or makes direction authoritative.
+            * Premature-stop characters are allele-specific: TGA and TAA at the
+              same codon are not assumed to be the same mutation.
+            * Frame arithmetic is signed: deletion = negative length, insertion
+              or residue restoration = positive length. Premature stops are
+              reported separately because they do not alter reading frame.
+
+      asr
+        03b Run codeml on the PAML-safe alignment and fixed topology.
+            Required settings:
+              clock = 0
+              fix_blength = 0
+              RateAncestor = 1
+              cleandata = 0
+            IQ-TREE is not required for the core ASR path.
+
+            Pensieve requires the marginal ancestral reconstruction, not PAML's
+            later optional joint reconstruction. The rst line `Nodes X to Y are
+            ancestral` defines the expected PAML ASR set for that run. Pensieve
+            reads only section `(1) Marginal reconstruction of ancestral
+            sequences` and requires every node X..Y exactly once at the expected
+            alignment length. It does NOT guess the count from tip number or n-2.
+            A non-zero codeml exit is allowed to continue when this marginal
+            validation succeeds; otherwise ASR remains fatal. Old rst files are
+            removed before each new codeml attempt.
+
+            codeml runs in the background and is polled. As soon as rst shows
+            the complete marginal section (the `Joint reconstruction of
+            ancestral sequences` marker appears), Pensieve stops codeml itself
+            rather than waiting on/risking a crash or OOM kill during PAML's
+            far more memory-hungry joint reconstruction, which Pensieve never
+            uses. Set PENSIEVE_ASR_POLL_SECONDS to change the poll interval
+            (default 10s).
+
+            IndelMaP is optional/independent. It never supplies the authoritative
+            ancestral gap state. --indelmap auto attempts it when available and
+            records failure without aborting the core Pensieve inference;
+            --indelmap yes requires an attempt but still preserves the core
+            result if IndelMaP itself fails; --indelmap no skips it.
+
+      integrate
+        04  Parse codeml marginal ancestral sequences, map PAML node numbers to
+            Pensieve-owned Node<i> labels by topology, and overlay Pensieve's
+            reconstructed structural states onto the PAML nucleotide scaffold.
+
+            The biological root is NOT given a fabricated PAML sequence under
+            clock=0. Its structural states can be known, but nucleotide/ORF
+            status is unavailable unless a real sequence reconstruction exists.
+
+            ORF state distinguishes intact, disrupted, uncertain and unavailable.
+            Branch-history output additionally gives explicit uncertainty classes
+            (for example confirmed disabling event but first loss unresolved, or
+            root-adjacent sequence disruption with no distinct clock=0 root
+            sequence) together with transition_evidence and uncertainty_reason.
+
+            Pseudogenic history is sticky: once a confident disabling lesion is
+            inferred, descendants remain descendants of that loss even if a
+            compensatory change later restores frame or an apparent ORF.
+
+            IndelMaP, when available, is compared in a concordance table only.
+
+      plot
+        05  Plot branch-resolved history. First disabling branch = strong red;
+            inherited pseudogenic history = pale red; uncertain origin = amber;
+            apparent frame/ORF restoration is annotated without turning the
+            lineage back into a functional grey branch.
+
+    ---------------------------------------------------------------------------
+    STEP HIERARCHY / RESUME
+    ---------------------------------------------------------------------------
+      diagnostics < alignment < events < asr < integrate < plot
+
+      --run_from_step STEP   first stage (default AUTO = diagnostics)
+      --run_up_to STEP       last stage  (default FULL = plot)
+
+      Backward-compatible aliases are accepted:
+        indel_discovery/macse -> diagnostics
+        MSA/msa               -> alignment
+        binary                -> events
+        omega/paml            -> asr
+
+      Resume logic validates prerequisite files; it does not require outputs to
+      be newer than the current invocation. --clean removes the selected stage
+      and downstream outputs before rerunning.
+
+    ---------------------------------------------------------------------------
+    INPUT OPTIONS
+    ---------------------------------------------------------------------------
+      --gene NAME
+      --fasta FILE
+      --tree FILE
+      --workdir DIR
+      --alignment perform|defined   default perform
+      --dated yes|no                default yes
+
+    ---------------------------------------------------------------------------
+    EVENT OPTIONS
+    ---------------------------------------------------------------------------
+      --tie-break none|ancestral|terminal
+          default none. Exact parsimony ties remain ambiguous in all cases.
+          ancestral/terminal only choose a representative history for outputs
+          that require one.
+
+      --breakpoint-tolerance N
+          default 0. Keep 0 unless manual inspection demonstrates a small
+          alignment offset that should be clustered.
+
+      --indelmap auto|yes|no
+          default auto. Independent concordance only; never authoritative gap
+          projection.
+
+    ---------------------------------------------------------------------------
+    EXECUTION OPTIONS
+    ---------------------------------------------------------------------------
+      --mode local|slurm          default local
+      --paml-mode same|local|slurm
+                                  retained for command compatibility. `slurm`
+                                  is deprecated and is normalized to local-in-
+                                  current-allocation execution; nested codeml
+                                  Slurm jobs are no longer submitted.
+      --threads N                 default 8
+      --time HOURS                whole-workflow Slurm walltime; default 96
+      --slurm-mem SIZE            default 64G
+      --slurm-partition NAME
+      --env-mode MODE             inherit|conda|mamba|venv; default inherit
+                                  inherit: use the environment/PATH from which
+                                  Pensieve was launched/submitted; no activation
+                                  commands are generated
+                                  conda/mamba: use `<manager> run -n ENV`
+                                  venv: source --venv-path/bin/activate
+      --env-name NAME             conda/mamba environment; default Pensieve
+      --venv-path PATH            Python venv path; default PACKAGE/.venv
+      --slurm-module NAME         optional site module to load in Slurm before
+                                  the workflow; no module is loaded by default
+      --clean
+      --skip-plot
+      --dry-run
+
+    ---------------------------------------------------------------------------
+    IMPORTANT OUTPUTS
+    ---------------------------------------------------------------------------
+      final_results/<gene>/important_output/
+        <gene>.canonical_alignment.fasta
+            observed tips in rooted-tree order; authoritative coordinates
+        <gene>.phylogenetic_msa.fasta
+            observed tips + reconstructed internodes in tree preorder
+        <gene>.phylogenetic_tip_order.tsv
+        <gene>.phylogenetic_sequence_order.tsv
+        <gene>.alignment_characters.tsv
+        <gene>.alignment_events.tsv
+        <gene>.ancestral_integrated_alignment.fa
+        <gene>.ancestral_native_cds.fa
+        <gene>.ancestral_orf_walk.tsv
+        <gene>.orf_transitions_by_branch.tsv
+        <gene>.pensieve_tree.nwk
+        <gene>.internode_label_crosswalk.tsv
+        <gene>.indelmap_concordance.tsv
+        <gene>.pseudogenization_tree.pdf/.png
+        <gene>.event_map.pdf/.png
+
+      final_results/<gene>/supporting_files/ retains PAML-safe alignment,
+      marginal-ASR validation/status, state tables and topology audits.
+
+    ---------------------------------------------------------------------------
+    SCIENTIFIC LIMITATIONS
+    ---------------------------------------------------------------------------
+      * Breakpoint homology depends on alignment quality. A curated defined
+        alignment remains the user's responsibility and is never rewritten.
+      * Gap-as-character parsimony is deliberately transparent but does not
+        model every property of indel evolution. IndelMaP is retained as an
+        independent indel-aware comparison when available.
+      * Exact parsimony ties are uncertainty, not evidence. Pensieve reports
+        them rather than converting a tie into a confident deletion/insertion.
+      * codeml posterior support describes its substitution scaffold, not the
+        lesion-overlaid native sequence.
+      * A computationally restored reading frame is not evidence of biological
+        resurrection of a lost gene.
+      * A disrupted ORF supports molecular pseudogenization but does not by
+        itself prove complete loss of every biological function or isoform.
+
+    Report the gene, Pensieve version, command line and relevant stage log when
+    asking for help.
+    """))
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("-h", "--help", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("-long", "--long", "--long-help", "--help-long",
+                        dest="long_help", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("-help", dest="help_alias", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--gene", required=True)
+    parser.add_argument("--fasta", default=None)
+    parser.add_argument("--tree", default=None)
+    parser.add_argument("--workdir", default=".")
+    parser.add_argument("--mode", choices=["local", "slurm"], default="local")
+    parser.add_argument("--paml-mode", choices=["local", "same", "slurm"], default="same")
+    parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--alignment", choices=["perform", "defined"], default="perform")
+    parser.add_argument("--dated", choices=["yes", "no"], default="yes")
+    parser.add_argument("--indelmap", choices=["auto", "yes", "no"], default="auto")
+    parser.add_argument("--tie-break", choices=["none", "ancestral", "terminal"], default="none")
+    parser.add_argument("--breakpoint-tolerance", type=int, default=0)
+    parser.add_argument("--run_from_step", "--run-from-step", default="AUTO")
+    parser.add_argument("--run_up_to", "--run-up-to", default="FULL")
+    parser.add_argument("--clean", action="store_true")
+    parser.add_argument("--skip-plot", action="store_true")
+    parser.add_argument("--on-missing-root-sequence", choices=["fail", "warn"], default="warn")
+    parser.add_argument("--dat-dir", default=None,
+                        help="PAML's empirical-model dat/ directory. Default: auto-detected next to "
+                             "wherever codeml resolves for --env-mode (e.g. a conda/mamba env's own "
+                             "dat/, installed by the bioconda paml package); never hard-coded.")
+    parser.add_argument("--env-mode", choices=["inherit", "conda", "mamba", "venv"], default="inherit")
+    parser.add_argument("--env-name", default="Pensieve")
+    parser.add_argument("--venv-path", default=None)
+    parser.add_argument("--slurm-mem", default="64G")
+    parser.add_argument("--time", "--time-hours", dest="time_hours", type=int, default=96)
+    parser.add_argument("--slurm-time", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--slurm-partition", default=None)
+    parser.add_argument("--slurm-module", default=None)
+    parser.add_argument("--dry-run", action="store_true")
+    return parser
+
+
+def main():
+    argv = sys.argv[1:]
+    help_flags = {"-h", "-help", "--help", "-?", "help"}
+    long_flags = {"-long", "--long", "--long-help", "--help-long", "-l"}
+    if not argv:
+        print_short_help()
+        return 0
+    if help_flags & set(argv):
+        print_long_help() if (long_flags & set(argv)) else print_short_help()
+        return 0
+    if long_flags & set(argv):
+        print_long_help()
+        return 0
+
+    root = Path(__file__).resolve().parents[1]
+    runner = root / "scripts" / "run_one_gene_00_to_04.sh"
+    args = build_parser().parse_args()
+    venv_path = Path(args.venv_path).expanduser().resolve() if args.venv_path else (root / ".venv")
+
+    def hours_from_legacy(value: str) -> int:
+        try:
+            days = 0
+            clock = value
+            if "-" in value:
+                day_text, clock = value.split("-", 1)
+                days = int(day_text)
+            parts = [int(item) for item in clock.split(":")]
+            if len(parts) == 3:
+                hours, minutes, seconds = parts
+            elif len(parts) == 2:
+                hours, minutes = parts
+                seconds = 0
+            else:
+                raise ValueError
+            total = days * 86400 + hours * 3600 + minutes * 60 + seconds
+            if total <= 0:
+                raise ValueError
+            return (total + 3599) // 3600
+        except ValueError:
+            sys.exit("--slurm-time must use HH:MM:SS or D-HH:MM:SS format")
+
+    if args.slurm_time:
+        args.time_hours = hours_from_legacy(args.slurm_time)
+    if args.time_hours <= 0:
+        sys.exit("--time must be a positive integer number of hours")
+    if args.threads <= 0:
+        sys.exit("--threads must be a positive integer")
+    if args.breakpoint_tolerance < 0:
+        sys.exit("--breakpoint-tolerance must be >= 0")
+
+    try:
+        run_from = normalise_step(args.run_from_step, for_from=True, skip_plot=args.skip_plot)
+        run_up_to = normalise_step(args.run_up_to, for_from=False, skip_plot=args.skip_plot)
+    except argparse.ArgumentTypeError as error:
+        sys.exit(str(error))
+    if STEP_ORDER[run_from] > STEP_ORDER[run_up_to]:
+        sys.exit(
+            f"Invalid step range: --run_from_step {run_from} is later than --run_up_to {run_up_to}. "
+            "The range must move forward through: diagnostics < alignment < events < asr < integrate < plot."
+        )
+
+    cwd = Path.cwd()
+    workdir = Path(args.workdir).expanduser().resolve()
+    workdir.mkdir(parents=True, exist_ok=True)
+    fasta = Path(args.fasta).expanduser().resolve() if args.fasta else find_default_fasta(args.gene, cwd)
+    tree = Path(args.tree).expanduser().resolve() if args.tree else find_default_tree(cwd)
+    if fasta is None or not fasta.exists():
+        sys.exit("Could not find input FASTA. Provide --fasta /full/path/to/file.fas")
+    if tree is None or not tree.exists():
+        sys.exit("Could not find species tree. Provide --tree /full/path/to/tree.nwk")
+
+    # Nested PAML Slurm was deliberately removed. In top-level --mode slurm the
+    # runner itself executes inside the single allocation, so codeml is local to
+    # that allocation. 'same' therefore resolves to 'local' in both modes.
+    if args.paml_mode == "slurm":
+        print("[WARN] --paml-mode slurm is deprecated in v3.31; codeml will run inside the current allocation.", file=sys.stderr)
+    paml_mode = "local"
+
+    dat_dir = (
+        Path(args.dat_dir).expanduser().resolve() if args.dat_dir
+        else resolve_paml_dat_dir(root, args.env_mode, args.env_name, venv_path, args.dry_run)
+    )
+
+    base_cmd = [
+        str(runner), "--gene", args.gene, "--fasta", str(fasta), "--tree", str(tree),
+        "--workdir", str(workdir), "--threads", str(args.threads), "--time-hours", str(args.time_hours),
+        "--alignment", args.alignment, "--dated", args.dated,
+        "--run_from_step", run_from, "--run_up_to", run_up_to,
+        "--paml-mode", paml_mode, "--dat-dir", str(dat_dir),
+        "--indelmap-dir", str(root / "external" / "indelMaP"), "--env-name", args.env_name,
+        "--on-missing-root-sequence", args.on_missing_root_sequence,
+        "--indelmap", args.indelmap,
+        "--tie-break", args.tie_break,
+        "--breakpoint-tolerance", str(args.breakpoint_tolerance),
+    ]
+    if args.clean:
+        base_cmd.append("--clean")
+    if args.skip_plot:
+        base_cmd.append("--skip-plot")
+
+    exec_cmd = environment_command(base_cmd, args.env_mode, args.env_name, venv_path)
+
+    if args.mode == "local":
+        if args.slurm_module:
+            print("[WARN] --slurm-module is ignored in --mode local", file=sys.stderr)
+        if args.env_mode in {"conda", "mamba"} and not args.dry_run and shutil.which(args.env_mode) is None:
+            sys.exit(f"--env-mode {args.env_mode} requested but '{args.env_mode}' is not on PATH")
+        if args.env_mode == "venv" and not args.dry_run and not (venv_path / "bin" / "activate").exists():
+            sys.exit(f"--env-mode venv requested but activation script is missing: {venv_path / 'bin' / 'activate'}")
+        print(shell_join(exec_cmd))
+        if not args.dry_run:
+            subprocess.check_call(exec_cmd)
+        return 0
+
+    days, remainder = divmod(args.time_hours, 24)
+    requested_time = f"{days}-{remainder:02d}:00:00" if days else f"{remainder:02d}:00:00"
+    logs = workdir / "logs"
+    slurm_dir = workdir / "slurm"
+    logs.mkdir(parents=True, exist_ok=True)
+    slurm_dir.mkdir(parents=True, exist_ok=True)
+    slurm_file = slurm_dir / f"pensieve_{args.gene}.slurm"
+    partition_line = f"#SBATCH --partition={args.slurm_partition}\n" if args.slurm_partition else ""
+    module_block = ""
+    if args.slurm_module:
+        module_name = shlex.quote(args.slurm_module)
+        module_block = f"""# Optional site-specific module requested by the user.
+if type module >/dev/null 2>&1; then
+  module load {module_name}
+elif command -v ml >/dev/null 2>&1; then
+  ml {module_name}
+else
+  echo "[ERROR] --slurm-module was requested but neither 'module' nor 'ml' is available" >&2
+  exit 1
+fi
+"""
+
+    if args.env_mode == "venv":
+        activation = venv_path / "bin" / "activate"
+        environment_block = f"""[[ -f {shlex.quote(str(activation))} ]] || {{ echo "[ERROR] Missing venv activation script: {activation}" >&2; exit 1; }}
+source {shlex.quote(str(activation))}
+"""
+        slurm_exec = shell_join(base_cmd)
+    elif args.env_mode in {"conda", "mamba"}:
+        manager = args.env_mode
+        environment_block = f"""command -v {manager} >/dev/null 2>&1 || {{ echo "[ERROR] --env-mode {manager} requested but {manager} is not on PATH in the Slurm job" >&2; exit 1; }}
+"""
+        slurm_exec = shell_join([manager, "run", "-n", args.env_name] + base_cmd)
+    else:
+        environment_block = "# Environment mode: inherit. No activation command is required.\n"
+        slurm_exec = shell_join(base_cmd)
+
+    slurm_text = f"""#!/bin/bash
+#SBATCH --job-name=Pensieve_{args.gene}
+#SBATCH --cpus-per-task={args.threads}
+#SBATCH --mem={args.slurm_mem}
+#SBATCH --time={requested_time}
+#SBATCH --output={logs}/%x_%j.out
+#SBATCH --error={logs}/%x_%j.err
+{partition_line}set -euo pipefail
+
+{module_block}{environment_block}cd {shlex.quote(str(workdir))}
+{slurm_exec}
+"""
+    slurm_file.write_text(slurm_text)
+    print(f"Wrote Slurm script: {slurm_file}")
+    if args.dry_run:
+        print(slurm_text)
+    else:
+        subprocess.check_call(["sbatch", str(slurm_file)])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
