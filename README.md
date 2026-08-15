@@ -4,7 +4,7 @@
 
 Pensieve is a gene-centred workflow for reconstructing **where coding-sequence lesions arose on a rooted species tree**. It combines a frameshift-aware MACSE alignment, PAML `codeml` ancestral nucleotide reconstruction, and its own parsimony-based event/history engine to answer, for any coding gene and any rooted tree of species: *which lineage lost this gene first, is the loss shared or independent, and what exactly broke it (a premature stop, a frameshifting indel, or something ambiguous)?* The result is a fully reconstructed ancestral sequence at every internal node and two publication-ready figures per gene.
 
-v3.31 made installation/execution portable across local machines and HPC systems (no assumption of Miniforge, mamba, or any site-specific module command); every release since has kept that portability while fixing real bugs found by running Pensieve on real genomes, listed in full in [`CHANGELOG.md`](CHANGELOG.md). The current release is v3.37 (see `VERSION`).
+v3.31 made installation/execution portable across local machines and HPC systems (no assumption of Miniforge, mamba, or any site-specific module command); every release since has kept that portability while fixing real bugs found by running Pensieve on real genomes, listed in full in [`CHANGELOG.md`](CHANGELOG.md). The current release is v4.2 (see `VERSION`).
 
 ---
 
@@ -190,7 +190,7 @@ This installs Python dependencies into the current Python and creates no conda/m
 
 Pensieve never assumes a module name. If your HPC requires a module to expose conda/mamba or external tools, load it yourself before installation or use the optional runtime `--slurm-module NAME` flag. For example, the site might require `module load <site-specific-name>`; that choice belongs to the user/site, not Pensieve.
 
-The existing `environment.yml` still contains several historical compatibility packages such as IQ-TREE and MUSCLE; **v3.31 does not call IQ-TREE or MUSCLE in its core workflow**.
+The existing `environment.yml` still contains a historical compatibility package, IQ-TREE, that Pensieve does not call. MACSE is the only sequence-alignment engine Pensieve uses.
 
 ## Help
 
@@ -252,7 +252,9 @@ pensieve ... --mode slurm --env-mode conda --slurm-module YOUR_SITE_MODULE
 
 ### `--alignment perform`
 
-MACSE's nucleotide alignment is the canonical coordinate system. Pensieve no longer creates a second MUSCLE alignment and no longer projects MACSE lesions between two independently generated alignments.
+MACSE's own nucleotide alignment is the single canonical coordinate system; MACSE is the only alignment engine Pensieve uses anywhere in the pipeline.
+
+A short, highly conserved stretch at the very start of the gene is checked separately first: if MACSE's own edit there does not clearly improve on a species' own real sequence, MACSE's edit is set aside in favor of that species' real sequence, so a lesion elsewhere in the gene can no longer disturb the start of the gene for anyone. This avoids a real failure mode where one broken (pseudogenized) sequence caused MACSE to introduce a spurious gap into the start codon of every other, perfectly intact species in the same alignment (real PDE6C data). In the rare case an accepted block edit leaves candidates of differing length, MACSE itself realigns just that block -- never a second tool.
 
 Two synchronized FASTAs contain the same columns:
 
@@ -474,6 +476,14 @@ intact
 ```
 
 `04_<GENE>.orf_transitions_by_branch.tsv` also reports `transition_evidence` and `uncertainty_reason`. A compensatory frameshift therefore does not produce a misleading loss → revival → loss tree.
+
+### Pseudogenized clades do not get extra votes just for being densely sampled
+
+Descendants of the same pseudogenization event share one evolutionary history after the gene died — they are not independent evidence about whether that loss happened, or when. Before reconstructing an individual indel or premature-stop change, Pensieve first builds a rough, sequence-only map of which parts of the tree are functional versus pseudogenic, then bounds how much influence a whole pseudogenic branch of the tree — however many species it contains — can have on the ancestor **above** it (the message that crosses the loss boundary going further up the tree). A clade sampled with 20 species carries about the same weight there as the same clade sampled with 2-3 species would. Mutations that happened *after* the gene broke are still fully reconstructed and reported; the component's own entry node (where the loss itself is placed) and everything inside the component always keep full, unbounded evidence — only the pull on ancestors *above* the loss is capped (v4.2; an earlier v4.0/v4.1 version of this correction also capped the entry node's own state, which was stronger than necessary and could overwrite real internal evidence). `03_<GENE>.provisional_orf_history.tsv` and `03_<GENE>.pseudogenic_components.tsv` record this intermediate map for inspection.
+
+### A raw premature stop must survive its own frame correction to count
+
+A single early frameshift can make a raw, unaligned sequence read many downstream premature stop codons in the shifted frame — those stops are consequences of the one frameshift, not independent nonsense mutations, and disappear as soon as that frameshift is corrected. Before a raw premature stop can found a phylogenetic character, Pensieve requires three things to hold simultaneously: the cumulative upstream MACSE frame correction is zero at that exact position (the frame is not shifted there), its three raw nucleotides map to three consecutive columns of the final canonical alignment (no placeholder wedged inside the codon), and the actual homologous codon read back from that final alignment is still exactly TAA/TAG/TGA. A stop that fails any of these is kept in the diagnostic registry (`02_<GENE>.masked_inframe_premature_stops_after_macse_correction.tsv`, `reason` column) but never enters parsimony or the event plot, and a tip whose own occurrence fails validation is never counted as carrying some other, independently-validated tip's stop character merely because its alignment segment spells the same codon.
 
 
 ## Safe handling of codeml joint-reconstruction failures

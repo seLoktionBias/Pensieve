@@ -157,6 +157,10 @@ def print_short_help():
       --fasta FILE             CDS FASTA, or codon alignment with --alignment defined
       --tree FILE              rooted species tree; pruned to shared taxa
       --alignment perform|defined
+                               perform (default): MACSE's own DNA-level alignment, after a
+                               conserved-start-block quality check (see --help --long),
+                               is the single canonical alignment. MACSE is the only
+                               alignment engine Pensieve uses.
       --dated yes|no           input branch lengths are dates/times for plotting (default yes)
       --mode local|slurm       run locally or submit the whole workflow to Slurm
       --env-mode MODE          inherit|conda|mamba|venv (default inherit)
@@ -177,7 +181,7 @@ def print_short_help():
 def print_long_help():
     print(textwrap.dedent("""\
     ===========================================================================
-    Pensieve v3.37 - full manual
+    Pensieve v4.2 - full manual
     ===========================================================================
 
     PURPOSE
@@ -213,13 +217,31 @@ def print_long_help():
             start state, length modulo 3 and ambiguity are retained.
         01  Run MACSE across the homologous sequence set for frameshift-aware
             diagnosis/alignment. MACSE '!' is treated as a partial-codon
-            placeholder, not intrinsically as a 1-bp deletion.
+            placeholder, not intrinsically as a 1-bp deletion. MACSE is the
+            single alignment engine Pensieve uses anywhere in the pipeline.
+
+            Conserved start-block quality check: MACSE can place a frame-
+            correction marker anywhere its own global alignment finds
+            cheapest, not necessarily near the lineage whose real lesion
+            caused it -- observed corrupting the highly conserved gene-start
+            block for species whose own actual pseudogenizing lesion lies
+            elsewhere. Pensieve detects how many codons from position 1 the
+            complete-ORF sequences agree on closely (the conserved block),
+            then for any species where MACSE modified that block, keeps the
+            modification only if it scores no worse, and strictly better on
+            at least one of nucleotide/amino-acid identity against a
+            complete-ORF consensus, than the species' own untouched raw
+            sequence there; otherwise the raw block is used and MACSE is
+            re-run once on the corrected input (and, in the rare case
+            accepted block edits leave candidates of differing length, MACSE
+            itself -- not a second tool -- realigns just that block).
+            Decisions are logged to 01_<gene>.conserved_block_correction.tsv.
 
       alignment
         02  Establish exactly one canonical coordinate system.
             --alignment perform:
-                MACSE nucleotide alignment is canonical; no second MUSCLE
-                realignment is created.
+                MACSE's own DNA-level alignment (after the conserved
+                start-block check above) is canonical.
             --alignment defined:
                 the supplied codon alignment is authoritative; Pensieve never
                 inserts/deletes/rebuilds columns. FASTA records are reordered
@@ -234,11 +256,18 @@ def print_long_help():
                   codons -> NNN.
 
             Raw premature-stop diagnoses are mapped into canonical alignment
-            coordinates before masking. STOP classification uses the cumulative
-            upstream MACSE frame correction modulo 3 at that exact STOP: a
-            non-zero phase is treated as a likely frameshift consequence, while
-            a compensated/restored phase (0 mod 3) remains eligible as an
-            independent nonsense mutation.
+            coordinates before masking, and only become independent nonsense-
+            mutation candidates if THREE gates all pass: (1) the cumulative
+            upstream MACSE frame correction modulo 3 at that exact STOP is
+            zero (frame not shifted -- a non-zero phase means the STOP is a
+            likely consequence of an earlier frameshift, not an independent
+            lesion); (2) the STOP's three raw nucleotides map to three
+            CONSECUTIVE canonical alignment columns (no placeholder/gap
+            wedged inside the codon); (3) the actual homologous codon read
+            back from the final canonical alignment at those columns is
+            still exactly TAA/TAG/TGA. A STOP that fails any gate is retained
+            in the diagnostic registry but never founds a phylogenetic
+            character or appears in the event plot.
 
       events
         03  Reconstruct alignment characters before any ancestral-sequence
@@ -252,7 +281,11 @@ def print_long_help():
               a representative display history but never removes the ambiguity
               flag or makes direction authoritative.
             * Premature-stop characters are allele-specific: TGA and TAA at the
-              same codon are not assumed to be the same mutation.
+              same codon are not assumed to be the same mutation. A tip whose
+              own STOP occurrence failed the three-gate validation above is
+              never counted as a carrier of another tip's validated STOP
+              character merely because its own alignment segment happens to
+              spell the same codon.
             * Frame arithmetic is signed: deletion = negative length, insertion
               or residue restoration = positive length. Premature stops are
               reported separately because they do not alter reading frame.
@@ -342,7 +375,7 @@ def print_long_help():
       --fasta FILE
       --tree FILE
       --workdir DIR
-      --alignment perform|defined   default perform
+      --alignment perform|defined   default perform (MACSE is the only aligner; see ALIGNMENT above)
       --dated yes|no                default yes
 
     ---------------------------------------------------------------------------

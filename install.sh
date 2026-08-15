@@ -154,7 +154,7 @@ try_staged_mamba(){
   fi
   run mamba install -y -n "$ENV_NAME" -c conda-forge numpy scipy pandas biopython ete3
   run mamba install -y -n "$ENV_NAME" -c conda-forge r-base r-ape r-ggplot2 r-dplyr r-readr r-stringr r-tidyr r-optparse
-  run mamba install -y -n "$ENV_NAME" -c conda-forge -c bioconda iqtree paml macse muscle emboss
+  run mamba install -y -n "$ENV_NAME" -c conda-forge -c bioconda iqtree paml macse emboss
 }
 
 try_staged_conda(){
@@ -165,7 +165,7 @@ try_staged_conda(){
   fi
   run conda install -y -n "$ENV_NAME" -c conda-forge numpy scipy pandas biopython ete3
   run conda install -y -n "$ENV_NAME" -c conda-forge r-base r-ape r-ggplot2 r-dplyr r-readr r-stringr r-tidyr r-optparse
-  run conda install -y -n "$ENV_NAME" -c conda-forge -c bioconda iqtree paml macse muscle emboss
+  run conda install -y -n "$ENV_NAME" -c conda-forge -c bioconda iqtree paml macse emboss
 }
 
 try_staged(){

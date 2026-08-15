@@ -5,7 +5,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 echo "[1/11] CLI help forms"
 for flag in -h -help --help; do python bin/pensieve "$flag" >/dev/null; done
 python bin/pensieve --help -long > /tmp/pensieve_long_help.$$
-grep -q "Pensieve v3.37 - full manual" /tmp/pensieve_long_help.$$
+grep -q "Pensieve v4.2 - full manual" /tmp/pensieve_long_help.$$
 grep -q "diagnostics < alignment < events < asr < integrate < plot" /tmp/pensieve_long_help.$$
 rm -f /tmp/pensieve_long_help.$$
 
@@ -33,7 +33,10 @@ if grep -R -n -E 'candidate_indel_frameshift_events|paml_indelmap_asr_combined' 
 fi
 
 echo "[8/11] No hard-coded user paths"
-if grep -R -n -E '/home/[a-z0-9_]+/|/Users/' bin scripts templates 2>/dev/null; then
+# Excludes __pycache__: running any test compiles imported scripts to .pyc,
+# which embeds the absolute source path as a debugging artifact -- a false
+# positive here, not a real hard-coded path in the source itself.
+if grep -R -n -E '/home/[a-z0-9_]+/|/Users/' --exclude-dir=__pycache__ bin scripts templates 2>/dev/null; then
   echo "Hard-coded user path found" >&2; exit 1
 fi
 

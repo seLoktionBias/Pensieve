@@ -30,6 +30,42 @@ def gapless_seq(seq):
     return clean_seq(seq).replace("-", "")
 
 
+def strip_terminal_stop(seq):
+    """Remove a single trailing TAA/TAG/TGA -- whatever this sequence's own
+    real (gap-stripped) last 3 characters are, if they spell a stop codon --
+    before anything else in the pipeline ever sees it.
+
+    v4.0: Pensieve no longer reconstructs a terminal stop codon at ancestral
+    nodes at all (see CHANGELOG) -- PAML's codon model structurally cannot
+    represent a stop as a state, and every attempt at parsimony-reconstructing
+    it from the tip alignment (three different designs across v3.35-v3.37)
+    kept surfacing new real failure modes as the alignment coordinate system
+    scattered a tip's own terminal codon in ways each fix only partially
+    covered. Removing the terminal stop from every input sequence up front
+    sidesteps the whole problem instead of continuing to chase it: there is
+    nothing left for any downstream step to reconstruct, mis-scatter, or
+    disagree about at the very end of the CDS.
+
+    Deliberately does NOT require len(real) % 3 == 0: a pseudogenized
+    sequence carrying an internal frameshift has no single consistent
+    reading frame end-to-end, but its literal last 3 real characters can
+    still spell a stop codon that must be stripped like any other -- gating
+    on mod3 left frameshifted sequences (e.g. Desmodus_rotundus, real PDE6C
+    data) with an untouched trailing TAA.
+
+    Removes exactly the sequence's own last 3 real (non-gap) characters,
+    wherever they fall in the string -- not just the literal last 3
+    characters -- so this is safe for both a gapless raw CDS and a
+    user-curated --alignment defined sequence that may carry trailing gaps.
+    """
+    real = gapless_seq(seq)
+    if len(real) < 3 or real[-3:] not in STOP_CODONS:
+        return seq
+    non_gap_idx = [i for i, c in enumerate(seq) if c != "-"]
+    remove = set(non_gap_idx[-3:])
+    return "".join(c for i, c in enumerate(seq) if i not in remove)
+
+
 def orf_check(seq):
     # ORF status is assessed on the biological sequence, not on alignment gaps.
     # N is kept in the coordinate system and length count; exact STOP codons are
@@ -82,6 +118,7 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
 
     recs = {r.id.split()[0]: clean_seq(str(r.seq)) for r in SeqIO.parse(args.fasta, "fasta")}
+    recs = {name: strip_terminal_stop(seq) for name, seq in recs.items()}
     tree = Phylo.read(args.tree, "newick")
     tree_tips = {t.name for t in tree.get_terminals()}
     fasta_names = set(recs)

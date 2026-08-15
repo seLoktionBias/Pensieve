@@ -9,6 +9,7 @@ ALIGNMENT="perform"; DATED="yes"; RUN_FROM_STEP="AUTO"; RUN_UP_TO="FULL"
 CLEAN=0; SKIP_PLOT=0; PAML_MODE="local"; DAT_DIR="$PROGRAM_DIR/dat"
 INDELMAP_DIR="$PROGRAM_DIR/external/indelMaP"; RUN_INDELMAP="no"; ENV_NAME="Pensieve"
 TIE_BREAK="none"; BREAKPOINT_TOLERANCE="0"; ON_MISSING_ROOT_SEQUENCE="warn"
+ORF_LOSS_COST="1.0"; ORF_RESTORATION_COST="2.0"; PSEUDOGENIC_BOUNDARY_CAP_VOTES="2.0"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -32,6 +33,9 @@ while [[ $# -gt 0 ]]; do
     --tie-break) TIE_BREAK="$2"; shift 2;;
     --breakpoint-tolerance) BREAKPOINT_TOLERANCE="$2"; shift 2;;
     --on-missing-root-sequence) ON_MISSING_ROOT_SEQUENCE="$2"; shift 2;;
+    --orf-loss-cost) ORF_LOSS_COST="$2"; shift 2;;
+    --orf-restoration-cost) ORF_RESTORATION_COST="$2"; shift 2;;
+    --pseudogenic-boundary-cap-votes) PSEUDOGENIC_BOUNDARY_CAP_VOTES="$2"; shift 2;;
     *) echo "[ERROR] Unknown argument: $1" >&2; exit 1;;
   esac
 done
@@ -208,6 +212,9 @@ if step_in_range events; then
     --alignment "results_02/$GENE/02_${GENE}.primary_codon_alignment_native.fasta" \
     --tree "results_02/$GENE/02_${GENE}.tree_for_asr.nwk" \
     --masked-stops "results_02/$GENE/02_${GENE}.masked_inframe_premature_stops_after_macse_correction.tsv" \
+    --orf-status "results_00/$GENE/00_${GENE}.orf_status.tsv" \
+    --orf-loss-cost "$ORF_LOSS_COST" --orf-restoration-cost "$ORF_RESTORATION_COST" \
+    --pseudogenic-boundary-cap-votes "$PSEUDOGENIC_BOUNDARY_CAP_VOTES" \
     --outdir "results_03/$GENE" --dated "$DATED" --tie-break "$TIE_BREAK" \
     --breakpoint-tolerance "$BREAKPOINT_TOLERANCE" --coordinate-system "canonical_codon_alignment"
 elif prereq_needed events; then require_events; fi

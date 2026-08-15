@@ -84,11 +84,21 @@ tr <- read.tree(tree_file)
 if (is.null(tr$node.label)) tr$node.label <- rep(NA_character_, tr$Nnode)
 blank <- is.na(tr$node.label) | tr$node.label == ""
 if (any(blank)) tr$node.label[blank] <- paste0("Node", which(blank))
-if (!dated || is.null(tr$edge.length)) tr$edge.length <- rep(1, nrow(tr$edge))
+if (is.null(tr$edge.length)) tr$edge.length <- rep(1, nrow(tr$edge))
 ntip <- length(tr$tip.label)
 
+# Real bug, reported directly: with --dated no, tips did not line up at a
+# common x position. Forcing every edge.length to 1 and letting ape lay the
+# tree out as an ordinary phylogram still spaces tips by their own edge
+# COUNT from the root (deeper lineages land further right, shallower ones
+# short of the others) -- it is not the same thing as a real cladogram.
+# ape's own use.edge.length=FALSE is the actual cladogram layout: it ignores
+# edge lengths entirely and aligns every tip at the same x position
+# regardless of topology depth. Verified directly: an unbalanced synthetic
+# tree gave tip x-coordinates (3,3,2,1) the old way and (3,3,3,3) with
+# use.edge.length=FALSE.
 tmpf <- tempfile(fileext = ".pdf"); pdf(tmpf, width = 8, height = 8)
-plot(tr, show.tip.label = FALSE, no.margin = TRUE, direction = "rightwards")
+plot(tr, show.tip.label = FALSE, no.margin = TRUE, direction = "rightwards", use.edge.length = dated)
 pp <- get("last_plot.phylo", envir = .PlotPhyloEnv)
 dev.off(); unlink(tmpf)
 

@@ -274,15 +274,72 @@ def node_ages(root, dated):
 
 # ---------------------------------------------------------------- parsimony
 
-def sankoff(nodes_post, tip_states, gain_cost, loss_cost, tie_break):
+def clamp_boundary_evidence(pair, cap):
+    """Bound how much a subtree's own internal cost pattern can influence
+    its PARENT's Sankoff decision, regardless of how many tips the subtree
+    contains.
+
+    Real problem (see docstring on pseudogenic_components() below): a
+    monophyletic pseudogenized clade with many descendant tips does not
+    inflate a SINGLE character's own cost trade-off by tip count alone --
+    ordinary Sankoff already handles a perfectly homogeneous clade (one
+    shared gain, zero extra cost regardless of size) correctly. The real
+    distortion is statistical: with more descendant tips, there are simply
+    more chances for SOME subset of them to happen to share a given
+    indel/STOP character densely enough that "call the clade's ancestor a
+    carrier" becomes the cheaper explanation for THAT one character -- and
+    with many structural characters scored independently, enough of them
+    tip that way to make an ancestor look multiply-disrupted in aggregate,
+    even when each individual call was locally "correct" under ordinary
+    parsimony. Capping the cost DIFFERENCE a component can hand to its own
+    parent (rather than the raw, unbounded pair) means a 20-tip pseudogenic
+    radiation can carry at most `cap` worth of extra weight toward "this
+    character was already present at the component's entry" -- the same
+    ceiling a 2-3 tip version of the identical clade would already produce
+    on its own, satisfying the sampling-density-invariance requirement
+    without touching the component's own, fully-resolved internal history.
+    """
+    d0, d1 = pair
+    diff = d1 - d0
+    if diff > cap:
+        diff = cap
+    elif diff < -cap:
+        diff = -cap
+    return (0.0, diff) if diff >= 0 else (-diff, 0.0)
+
+
+def sankoff(nodes_post, tip_states, gain_cost, loss_cost, tie_break,
+            component_entry_idx=None, boundary_cap=None):
     """Binary Sankoff with explicit tie reporting and a representative history.
 
     A representative assignment is needed for plotting/output, but equal-cost
     alternatives remain explicitly ambiguous. No tie-break setting is allowed to
     convert an exact tie into biological certainty.
+
+    component_entry_idx/boundary_cap (both optional; default None/None
+    preserves the exact original, uncapped behavior): node indices that are
+    the entry point of a Stage-B pseudogenic component (see
+    pseudogenic_components()). Each such node's OWN down-cost pair is still
+    computed normally, in full, from its own real children -- nothing about
+    the component's internal resolution changes. Only the copy of that pair
+    HANDED TO THE NODE'S PARENT is bounded (clamp_boundary_evidence), so
+    everything ABOVE the component boundary sees at most `boundary_cap`
+    worth of evidence from the whole component, however many tips it
+    actually contains.
+
+    Capping is intentionally NOT applied in the traceback/up-pass: the
+    entry node's OWN reported state and confidence use its full, unbounded
+    down-cost pair, exactly like every node strictly inside the component.
+    An earlier version of this correction also capped the entry node's own
+    up-pass decision, which is stronger than the sampling-density fix
+    requires and can overwrite real internal evidence at the entry node
+    itself (e.g. GRK7/GUCY2F review). Only the MESSAGE that crosses the
+    component boundary upward -- i.e. what an ancestor ABOVE the entry node
+    uses when computing its own cost -- is bounded.
     """
     trans = ((0.0, gain_cost), (loss_cost, 0.0))
     down = {}
+    entry_idx = component_entry_idx or set()
     for node in nodes_post:
         if node.is_tip:
             obs = tip_states.get(node.name)
@@ -292,7 +349,10 @@ def sankoff(nodes_post, tip_states, gain_cost, loss_cost, tie_break):
         costs = [0.0, 0.0]
         for parent_state in (ABSENT, PRESENT):
             costs[parent_state] = sum(
-                min(trans[parent_state][s] + down[c.idx][s] for s in (ABSENT, PRESENT))
+                min(trans[parent_state][s] +
+                    (clamp_boundary_evidence(down[c.idx], boundary_cap)[s]
+                     if c.idx in entry_idx and boundary_cap is not None else down[c.idx][s])
+                    for s in (ABSENT, PRESENT))
                 for c in node.children)
         down[node.idx] = costs
 
@@ -316,7 +376,15 @@ def sankoff(nodes_post, tip_states, gain_cost, loss_cost, tie_break):
             continue
         pstate = assign[node.idx]
         for child in node.children:
-            options = [(trans[pstate][s] + down[child.idx][s], s) for s in (ABSENT, PRESENT)]
+            # The traceback/up-pass always uses each child's real, unbounded
+            # down-cost pair -- including when child is itself a component
+            # entry node. Bounding only applies to the down-pass sum used by
+            # a node's PARENT (see sankoff()'s docstring): the entry node's
+            # own C=ABSENT-vs-PRESENT decision must reflect its full
+            # descendant evidence, exactly like every node strictly inside
+            # the component.
+            child_down = down[child.idx]
+            options = [(trans[pstate][s] + child_down[s], s) for s in (ABSENT, PRESENT)]
             lo = min(v for v, _ in options)
             tied = [s for v, s in options if v == lo]
             delta[child.idx] = abs(options[0][0] - options[1][0])
@@ -334,6 +402,79 @@ def sankoff(nodes_post, tip_states, gain_cost, loss_cost, tie_break):
                 chosen = tied[0]
             assign[child.idx] = chosen
     return assign, best, ambiguous, delta
+
+
+# ---------------------------------------------------------- ORF-aware boundary evidence
+
+def read_tip_orf_states(orf_status_rows, tips):
+    """Definite per-tip Functional/Pseudogenic calls from 00_<gene>.orf_status
+    .tsv's own complete_orf column -- the SAME per-species, reference-free
+    classification already used everywhere else in Pensieve (starts with
+    ATG, length a multiple of 3, no internal in-frame STOP; a MISSING
+    terminal STOP is deliberately not disqualifying). A tip absent from the
+    status table, or otherwise not resolvable, contributes no forced state
+    (None), exactly like an unobserved tip in any other Sankoff character
+    here -- it must not vote either way.
+    """
+    by_species = {r.get("species"): r for r in orf_status_rows}
+    states = {}
+    for tip in tips:
+        row = by_species.get(tip)
+        if row is None:
+            states[tip] = None
+            continue
+        states[tip] = PRESENT if not trueish(row.get("complete_orf")) else ABSENT
+    return states
+
+
+def pseudogenic_components(nodes_post, root, tip_orf_states, orf_loss_cost, orf_restoration_cost, tie_break):
+    """Stage A + Stage B: a provisional, tree-wide ORF-history map, and the
+    set of branches that are the confirmed entry point of a contiguous
+    pseudogenic (P) component.
+
+    This is deliberately computed ONCE, from tip-level ORF completeness
+    evidence ONLY (never from any single structural character's own
+    reconstruction), specifically to avoid circularity: using one
+    potentially-biased indel/STOP reconstruction to decide what counts as
+    "pseudogenic," and then using that same verdict to fix the
+    reconstruction it came from. F->P ("the gene broke") costs
+    orf_loss_cost; the reverse, P->F ("an apparently dead gene came back"),
+    costs the much larger orf_restoration_cost by default -- biologically
+    rare and should not be invented for free just because a component
+    happens to contain many easy, independent F->P losses instead. The root
+    is never forced: sankoff() only ever reports a representative value at
+    a genuine tie, and the tie itself is preserved in `ambiguous`.
+
+    A branch parent->child is a confirmed component entry only when BOTH
+    the parent's and the child's own Stage-A state are unambiguous (parent
+    confidently F, child confidently P) -- an uncertain entering history is
+    never upgraded into an invented first-loss boundary; it simply does not
+    trigger any Stage-C compression, matching Stage B's "carry the
+    uncertainty forward" requirement.
+
+    Returns (orf_assign, orf_ambiguous, component_entry_idx, component_of)
+    where component_of maps every node index inside a component (the entry
+    node and everything below it, down to the next nested entry if any) to
+    the entry node's own name, for audit/reporting purposes only.
+    """
+    orf_assign, _score, orf_ambiguous, _delta = sankoff(
+        nodes_post, tip_orf_states, orf_loss_cost, orf_restoration_cost, tie_break)
+
+    component_entry_idx = set()
+    for node in iter_nodes(root, "preorder"):
+        if node.parent is None:
+            continue
+        if node.parent.idx in orf_ambiguous or node.idx in orf_ambiguous:
+            continue
+        if orf_assign[node.parent.idx] == ABSENT and orf_assign[node.idx] == PRESENT:
+            component_entry_idx.add(node.idx)
+
+    component_of = {}
+    for entry_node in (n for n in iter_nodes(root, "preorder") if n.idx in component_entry_idx):
+        for descendant in iter_nodes(entry_node, "preorder"):
+            component_of.setdefault(descendant.idx, entry_node.name)
+
+    return orf_assign, orf_ambiguous, component_entry_idx, component_of
 
 
 # ---------------------------------------------------------------- event merging
@@ -634,16 +775,34 @@ def stop_mask_characters(masked_stops, alignment, tips):
     """
     groups = defaultdict(set)
     alleles_at_span = defaultdict(dict)
+    # Every tip's OWN raw-STOP evidence at each exact (species, start, end),
+    # whether or not it passed validation, plus whether that occurrence was
+    # SPECIFICALLY explained away as a frame-dependent consequence of an
+    # earlier, unrelated frameshift (see the CNGA3/Phyllostomus discolor
+    # regression). A tip with that specific, informative negative evidence
+    # must never be resurrected as a carrier of another tip's validated
+    # character merely because its alignment segment spells the same three
+    # letters. A tip with no row here at all, or one that simply was never
+    # independently classified for some other/unregistered reason, still
+    # falls through to the ordinary segment-text-match check below -- see
+    # test_shared_stop_not_missed_when_only_one_tip_is_registered, a real
+    # PDE6H case where a genuinely shared mutation's second occurrence
+    # legitimately never got its own independent classification at all.
+    occurrence_by_tip_span = {}
     for row in masked_stops:
-        if not trueish(row.get("pseudogenizing_event_candidate")):
-            continue
-        if "independent_stop_candidate" in row and not trueish(row.get("independent_stop_candidate")):
-            continue
         start = safe_int(row.get("primary_alignment_start"))
         end = safe_int(row.get("primary_alignment_end"))
         species = row.get("species", "")
         codon = str(row.get("stop_codon", "")).upper()
         if start is None or end is None or not species or codon not in {"TAA", "TAG", "TGA"}:
+            continue
+        occurrence_by_tip_span[(species, start, end)] = {
+            "codon": codon,
+            "frame_shifted": trueish(row.get("frame_shifted_at_stop")),
+        }
+        if not trueish(row.get("pseudogenizing_event_candidate")):
+            continue
+        if "independent_stop_candidate" in row and not trueish(row.get("independent_stop_candidate")):
             continue
         groups[(start, end, codon)].add(species)
         alleles_at_span[(start, end)][species] = codon
@@ -653,24 +812,19 @@ def stop_mask_characters(masked_stops, alignment, tips):
         states = {}
         for tip in tips:
             seg = alignment[tip][start - 1:end].upper()
+            own = occurrence_by_tip_span.get((tip, start, end))
             if tip in carriers:
                 states[tip] = PRESENT
             elif tip in alleles_at_span[(start, end)]:
                 states[tip] = ABSENT  # another STOP allele is a different mutation
+            elif own is not None and own["codon"] == codon and own["frame_shifted"]:
+                # This tip's own raw STOP at this exact span/allele was
+                # explicitly classified as a consequence of an earlier
+                # frameshift, not an independent lesion. It must not be
+                # resurrected as a carrier of this specific mutation just
+                # because the alignment text matches.
+                states[tip] = ABSENT
             elif seg and seg == codon:
-                # This tip's own raw-sequence premature-stop scan did not
-                # register this exact occurrence as an independent candidate
-                # (e.g. upstream frameshift bookkeeping in ITS raw coordinates
-                # routed it through the generic "mask any stop before writing
-                # the PAML-safe alignment" catch-all instead). The canonical
-                # alignment is the authoritative coordinate system this
-                # character's (start, end, codon) are defined in; if this
-                # tip's own column segment there is the exact same stop
-                # allele as the character it is being compared against, it
-                # carries that character -- the per-species classification
-                # gate above only decides whether an occurrence is reliable
-                # enough to *found* a shared character, not whether some
-                # other tip carries an already-established one.
                 states[tip] = PRESENT
             elif seg and all(c in ACGT for c in seg):
                 states[tip] = ABSENT
@@ -749,12 +903,42 @@ def main():
                              "Start at 0 so real alignment disagreement is visible.")
     parser.add_argument("--min-carriers", type=int, default=2)
     parser.add_argument("--coordinate-system", default="primary_codon_alignment")
+    parser.add_argument("--orf-status", default=None,
+                        help="00_<gene>.orf_status.tsv (tip-level complete_orf calls). When given, enables "
+                             "ORF-history-aware, pseudogenic-component-bounded character reconstruction "
+                             "(Stage A/B/C): a provisional per-node Functional/Pseudogenic history is built "
+                             "from this tip evidence ALONE (never from indel/STOP character calls, to avoid "
+                             "circularity), and every confirmed F->P component's contribution to structural "
+                             "character reconstruction ABOVE its own entry branch is capped at "
+                             "--pseudogenic-boundary-cap-votes, so a densely-sampled pseudogenized clade "
+                             "cannot out-vote a genuinely functional ancestor merely by tip count. Omit to "
+                             "get the exact prior (v4.0 and earlier) uncapped behavior.")
+    parser.add_argument("--orf-loss-cost", type=float, default=1.0,
+                        help="Stage A: cost of an ordinary F->P (gene breaks) transition in the provisional "
+                             "ORF-history reconstruction. Only the ratio to --orf-restoration-cost matters.")
+    parser.add_argument("--orf-restoration-cost", type=float, default=2.0,
+                        help="Stage A: cost of a P->F (apparently dead gene restored) transition -- kept "
+                             "larger than --orf-loss-cost by default since true functional reversion "
+                             "after pseudogenization is rare. A restoration:loss ratio sensitivity grid "
+                             "(2/4/8/16) produced byte-identical real-data output (real GUCY2F, "
+                             "Bat_genes_from_Song) and identical synthetic-test behavior at every ratio "
+                             "tested; 2.0 (the smallest, most conservative ratio tested) is used as the "
+                             "default per that stability -- see restoration_penalty_sensitivity.tsv.")
+    parser.add_argument("--pseudogenic-boundary-cap-votes", type=float, default=2.0,
+                        help="Stage C: maximum number of equivalent independent-tip votes a whole "
+                             "pseudogenic component may contribute to its own parent's structural-character "
+                             "cost, regardless of how many real descendant tips it contains -- the cap "
+                             "itself is this value times max(gain_cost, loss_cost) for that character.")
     args = parser.parse_args()
 
     if args.gain_cost <= 0 or args.loss_cost <= 0:
         raise SystemExit("--gain-cost and --loss-cost must be positive")
     if args.breakpoint_tolerance < 0:
         raise SystemExit("--breakpoint-tolerance must be >= 0")
+    if args.orf_loss_cost <= 0 or args.orf_restoration_cost <= 0:
+        raise SystemExit("--orf-loss-cost and --orf-restoration-cost must be positive")
+    if args.pseudogenic_boundary_cap_votes <= 0:
+        raise SystemExit("--pseudogenic-boundary-cap-votes must be positive")
 
     gene = args.gene
     dated = args.dated == "yes"
@@ -773,6 +957,40 @@ def main():
     if missing:
         raise SystemExit(f"{len(missing)} tree tip(s) absent from the alignment: {missing[:10]}")
     extra = sorted(set(alignment) - set(tips))
+
+    # ---- Stage A/B: provisional, tip-evidence-only ORF history and
+    # pseudogenic-component boundaries (see pseudogenic_components()).
+    # Computed once, before any structural character is reconstructed, and
+    # reused for every character below -- never the other way around.
+    component_entry_idx, component_of, orf_assign, orf_ambiguous = set(), {}, {}, set()
+    if args.orf_status:
+        orf_status_rows = read_tsv(args.orf_status)
+        tip_orf_states = read_tip_orf_states(orf_status_rows, tips)
+        orf_assign, orf_ambiguous, component_entry_idx, component_of = pseudogenic_components(
+            nodes_post, root, tip_orf_states, args.orf_loss_cost, args.orf_restoration_cost, args.tie_break)
+        print(f"[info] ORF-aware boundary evidence: {len(component_entry_idx)} pseudogenic component(s) "
+              f"identified from tip-level ORF status; boundary cap = "
+              f"{args.pseudogenic_boundary_cap_votes:g} equivalent tip vote(s)")
+        write_tsv(
+            [{"gene": gene, "node_label": n.name,
+              "node_type": "tip" if n.is_tip else ("root" if n is root else "internal"),
+              "provisional_orf_state": "ambiguous" if n.idx in orf_ambiguous else
+                                       ("pseudogenic" if orf_assign.get(n.idx) == PRESENT else "functional"),
+              "is_component_entry": n.idx in component_entry_idx,
+              "pseudogenic_component": component_of.get(n.idx, "NA")}
+             for n in nodes_post],
+            out / f"03_{gene}.provisional_orf_history.tsv",
+            ["gene", "node_label", "node_type", "provisional_orf_state", "is_component_entry",
+             "pseudogenic_component"],
+        )
+        write_tsv(
+            [{"gene": gene, "component_entry_node": n.name,
+              "entry_branch": f"{n.parent.name}->{n.name}",
+              "n_descendant_tips": sum(1 for t in iter_nodes(n, "preorder") if t.is_tip)}
+             for n in iter_nodes(root, "preorder") if n.idx in component_entry_idx],
+            out / f"03_{gene}.pseudogenic_components.tsv",
+            ["gene", "component_entry_node", "entry_branch", "n_descendant_tips"],
+        )
 
     ages = node_ages(root, dated)
     write_newick(root, out / f"03_{gene}.pensieve_labelled_dated_tree.nwk")
@@ -861,8 +1079,16 @@ def main():
         # thousands of unrelated, harmless variants as spuriously "gap"-biased.
         orf_relevant = character["klass"] == "stop_mask" or (character["klass"] == "indel" and length % 3 != 0)
         gain_cost, loss_cost = (args.gain_cost, args.loss_cost) if orf_relevant else (1.0, 1.0)
+        # Stage C: every structural character (not just ORF-relevant ones --
+        # a pseudogenic clade's ordinary in-frame indels are just as
+        # susceptible to the same many-descendants statistical inflation)
+        # gets its pseudogenic-component contribution bounded, using THIS
+        # character's own gain/loss costs to scale the cap.
+        boundary_cap = (args.pseudogenic_boundary_cap_votes * max(gain_cost, loss_cost)
+                        if component_entry_idx else None)
         assign, score, ambiguous, delta = sankoff(
-            nodes_post, states, gain_cost, loss_cost, args.tie_break)
+            nodes_post, states, gain_cost, loss_cost, args.tie_break,
+            component_entry_idx=component_entry_idx, boundary_cap=boundary_cap)
         root_state = assign[root.idx]
 
         for node in nodes_post:

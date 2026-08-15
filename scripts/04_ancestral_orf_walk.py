@@ -191,74 +191,6 @@ def orf_check(aligned_sequence, structural_uncertain=False):
     }
 
 
-def own_terminal_codon(aligned_sequence):
-    """A tip's own true terminal codon, from ITS OWN sequence, ignoring the
-    multiple-alignment's column coordinates entirely.
-
-    A tip's real, biological sequence has no gap in it at all; the gap only
-    exists in the shared multiple-alignment coordinate system, inserted
-    wherever OTHER lineages have length this tip does not. When another
-    lineage has unrelated extra sequence anywhere near a tip's own true
-    C-terminus, that padding can land in the middle of -- or immediately
-    after -- this tip's own last codon, scattering its 3 real bases across
-    non-adjacent alignment columns even though, in the tip's own real
-    sequence, they are perfectly contiguous. Reading a fixed span of raw
-    alignment columns is therefore not reliable for finding "the" terminal
-    codon; stripping gaps first and taking the last 3 real bases is.
-    Returns a 3-character codon, or None if fewer than 3 real bases exist.
-    """
-    ungapped = aligned_sequence.replace("-", "")
-    return ungapped[-3:].upper() if len(ungapped) >= 3 else None
-
-
-def fitch_reconstruct_codon(root, tip_codons):
-    """Two-pass Fitch parsimony treating a whole codon as one discrete state.
-
-    PAML's codon-substitution model has a 61-state (sense-codon-only) state
-    space by construction, so it can never reconstruct a stop codon at any
-    node -- including the ordinary, universal terminal stop present in
-    virtually every intact tip, which is not a lesion at all. That column is
-    masked to N for every tip before codeml ever sees it, so PAML's own
-    reconstruction there is not just wrong, it is uninformed: nothing in its
-    model or its input constrains it. This reconstructs that span directly
-    from the real observed tip data instead.
-
-    Ordinary bottom-up parsimony: look at the state of the tips (or already-
-    resolved children) under a node and assign that node the same state when
-    they agree, all the way from the tips up to the root. The state used per
-    tip is its own derived terminal codon (see own_terminal_codon()) rather
-    than a fixed span of raw alignment columns, so a real, contiguous codon
-    that a nearby unrelated insertion happened to scatter across non-adjacent
-    columns is still read correctly.
-
-    tip_codons: {tip_name: 3-character codon string, or None if undetermined}.
-    Returns {node_name: resolved_codon_or_None} for every node in the tree.
-    """
-    down = {}
-    for node in iter_nodes(root, order="postorder"):
-        if node.is_tip:
-            codon = tip_codons.get(node.name)
-            down[node] = {codon} if codon else None
-        else:
-            child_sets = [s for s in (down[c] for c in node.children) if s is not None]
-            if not child_sets:
-                down[node] = None
-            else:
-                inter = set.intersection(*child_sets)
-                down[node] = inter if inter else set.union(*child_sets)
-    resolved = {}
-    for node in iter_nodes(root, order="preorder"):
-        candidates = down[node]
-        parent_codon = resolved.get(node.parent.name) if node.parent is not None else None
-        if candidates is None:
-            resolved[node.name] = None
-        elif parent_codon is not None and parent_codon in candidates:
-            resolved[node.name] = parent_codon
-        else:
-            resolved[node.name] = min(candidates)
-    return resolved
-
-
 def main():
     parser = argparse.ArgumentParser(description="Build lesion-aware ancestral sequences and ORF history.")
     parser.add_argument("--gene", required=True)
@@ -303,27 +235,6 @@ def main():
     characters = {r["character_id"]: r for r in read_tsv(args.characters)}
     states = {(r["character_id"], r["node_label"]): r.get("state", "unknown") for r in read_tsv(args.character_states)}
     events = read_tsv(args.events)
-
-    # Reconstruct the terminal (biologically ordinary, non-disrupting) stop
-    # codon at internal nodes directly from each tip's own true sequence,
-    # once, up front -- see own_terminal_codon()/fitch_reconstruct_codon()
-    # for why neither PAML's own scaffold nor a fixed span of raw alignment
-    # columns can be trusted for this. The result is written into the fixed
-    # final 3 columns of the "integrated" alignment below purely to keep
-    # every record the same width; the VALUE itself comes from each
-    # descendant's own real sequence, not from those columns.
-    tip_align_lengths = {len(seq) for seq in tips_native.values()}
-    terminal_fitch_columns = []
-    if len(tip_align_lengths) == 1:
-        aln_len = next(iter(tip_align_lengths))
-        term_start0 = aln_len - 3
-        if term_start0 >= 0:
-            tip_codons = {t: own_terminal_codon(seq) for t, seq in tips_native.items()}
-            resolved_codons = fitch_reconstruct_codon(pensieve, tip_codons)
-            for offset in range(3):
-                col = term_start0 + offset
-                resolved_bases = {label: codon[offset] for label, codon in resolved_codons.items() if codon}
-                terminal_fitch_columns.append((col, resolved_bases))
 
     integrated = {}
     native_cds = {}
@@ -411,9 +322,6 @@ def main():
                 fill = (codon * (((end - start + 1) // 3) + 1))[:end - start + 1]
                 for offset, ch in enumerate(fill):
                     if start - 1 + offset < len(chars): chars[start - 1 + offset] = ch
-            for col, resolved in terminal_fitch_columns:
-                if col < len(chars) and label in resolved:
-                    chars[col] = resolved[label]
             integrated[label] = "".join(chars)
 
         result = orf_check(integrated[label], structural_uncertain=uncertain)
@@ -494,10 +402,28 @@ def main():
                 # pre-root pseudogenic history as unresolved, never as known.
                 root_history_uncertain = True
         elif char.get("character_class") == "stop_mask" and root_state == "stop_present":
-            # An independently mapped premature STOP allele is itself a
-            # disabling nucleotide state, so confident root presence supports
-            # a loss predating the sampled tree.
-            root_disabling = True
+            # Real bug, found by inspecting real GUCY2F and CNGB3 data
+            # directly: a stop_mask character observed in as few as 1-3 tips
+            # (out of 100+), with n_observed_absent == 0 everywhere else
+            # (every other tip is "unknown", not confidently lacking the
+            # stop), still gets a Fitch root reconstruction of "present" --
+            # with zero contradicting "absent" evidence anywhere in the tree,
+            # "present" costs zero state changes at every node including the
+            # root, so parsimony reports it with a perfect (0) score even
+            # though only a handful of, likely deeply nested, tips actually
+            # carry it. That single unsupported character flipped
+            # root_disabling True for the WHOLE gene, making every
+            # subsequent independent pseudogenization anywhere in the tree
+            # render as "already_pseudogenic" (pale, inherited) instead of
+            # its own fresh "pseudogenization" (solid red) call -- exactly
+            # the "no red branches, only pale pink" symptom reported for
+            # both genes. A stop character only has real phylogenetic
+            # contrast -- and can only genuinely support a pre-root loss --
+            # if at least one tip is confidently observed WITHOUT it.
+            if safe_int(char.get("n_observed_absent")):
+                root_disabling = True
+            else:
+                root_history_uncertain = True
 
     known_history = {pensieve.name: True if root_disabling else (None if root_history_uncertain else False)}
     branch_rows = []
@@ -521,6 +447,25 @@ def main():
                 ambiguous_disabling.append(ev.get("event_id", "NA"))
 
         parent_hist = known_history.get(parent, None)
+        if parent_status == "intact":
+            # Real bug, found by inspecting real GUCY2F/CNGB3 data: sticky
+            # known_pseudogenic_history (see "apparent_orf_restoration" below)
+            # is deliberately True for a node whose OWN current sequence is
+            # intact but whose more distant ancestor was pseudogenized. That
+            # stickiness is correct for THAT node's own record, but blindly
+            # propagating it to its CHILDREN made a child's brand-new,
+            # independent disabling event render as "already_pseudogenic"
+            # (pale, inherited) even when the immediate parent is displayed
+            # grey/intact -- visually and semantically contradictory: two
+            # sister branches each independently pseudogenized off a
+            # genuinely functional common ancestor must both get their own
+            # fresh "pseudogenization" (solid red) call, not inherit a
+            # lineage-wide pale tint from a restoration two nodes back. A
+            # parent's own directly-reconstructed intact sequence is the
+            # strongest available evidence and must reset history for its
+            # children, exactly like the child_status=="intact" fixes below
+            # trust the sequence over catalogued/propagated signals.
+            parent_hist = False
         root_adjacent = node.parent is pensieve
         uncertainty_reason = "NA"
         transition_evidence = "NA"

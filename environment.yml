@@ -15,7 +15,6 @@ dependencies:
   - iqtree
   - paml
   - macse
-  - muscle
   - emboss
   - r-base
   - r-ape
