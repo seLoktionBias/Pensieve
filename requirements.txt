@@ -32,11 +32,6 @@ See requirements-pip.txt for numpy, scipy, pandas, biopython and ete3. This file
 supports the venv/current installer backends and intentionally excludes external
 scientific executables that pip cannot provide reliably.
 
-Optional concordance runtime
-----------------------------
-IndelMaP plus its Python dependencies. IndelMaP is optional and never supplies
-the authoritative ancestral structural state.
-
 Retained compatibility packages
 -------------------------------
 environment.yml still includes IQ-TREE, MUSCLE, EMBOSS and several historical

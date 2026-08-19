@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import difflib
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -114,20 +115,42 @@ def validate_equal_alignment(records: Dict[str, str], order: List[str], allowed:
     return length
 
 
-def raw_nt_to_alignment_column(aligned: str, raw_pos: int, macse_mode: bool) -> int | None:
-    """Map 1-based ungapped biological nucleotide index to 1-based alignment column.
+def build_raw_to_alignment_map(aligned: str, raw_seq: str) -> Dict[int, int]:
+    """Build a full 1-based-raw-position -> 1-based-alignment-column map for
+    one species' own row, once, for repeated lookup.
 
-    MACSE '!' is a synthetic partial-codon placeholder and therefore does not
-    consume a nucleotide from the raw sequence.
+    MACSE never deletes or reorders a real input character, but it can
+    insert synthetic characters not present in the raw input at all -- not
+    only its own documented '!' partial-codon placeholder, but (confirmed on
+    real data: GUCA1C/Desmodus_rotundus) occasionally a literal ambiguity
+    code like 'N' standing in for a position it could not resolve, with no
+    '!' involved, and sometimes more than once in the same row. Skipping
+    only '-' and '!' therefore silently miscounts whenever MACSE emits one
+    of these. A naive single-pass greedy character match (advance on match,
+    otherwise skip) also breaks down as soon as there is more than one such
+    insertion in the same row -- it has no way to recover once a real
+    character fails to match by coincidence, and can stall with no further
+    matches for the rest of the sequence (confirmed on real data: this
+    exact failure mode blocked GUCA1C/Desmodus_rotundus's STOP-coordinate
+    mapping entirely). See build_raw_to_alignment_map() in
+    01_run_macse_and_extract_events.py for the full real-data account.
+
+    A proper sequence alignment (difflib's longest-matching-block algorithm)
+    between the species' own raw sequence and the non-gap characters of its
+    aligned row does not have this failure mode: every 'equal' opcode block
+    is, by construction, a genuine, correctly-ordered run of real raw
+    characters, however many separate synthetic insertions sit between them.
     """
-    seen = 0
-    for column, ch in enumerate(aligned, start=1):
-        if ch == "-" or (macse_mode and ch == "!"):
+    non_gap_positions = [i for i, c in enumerate(aligned) if c != "-"]
+    non_gap_chars = "".join(aligned[i] for i in non_gap_positions)
+    sm = difflib.SequenceMatcher(None, raw_seq.upper(), non_gap_chars.upper(), autojunk=False)
+    mapping: Dict[int, int] = {}
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag != "equal":
             continue
-        seen += 1
-        if seen == raw_pos:
-            return column
-    return None
+        for k in range(i2 - i1):
+            mapping[i1 + k + 1] = non_gap_positions[j1 + k] + 1
+    return mapping
 
 
 def safe_int(value) -> int | None:
@@ -211,11 +234,11 @@ def load_raw_stop_diagnostics(r0: Path, r1: Path, gene: str) -> List[dict]:
 
 
 def build_stop_registry(gene: str, raw_stops: List[dict], canonical_source: Dict[str, str],
-                        macse_mode: bool, coordinate_system: str) -> List[dict]:
+                        raw_by_species: Dict[str, str], coordinate_system: str) -> List[dict]:
     """Map each raw premature STOP into canonical alignment coordinates and
     decide whether it may found an independent nonsense-mutation event.
 
-    Three independent gates must all pass, matching the ChatGPT-review
+    Four independent gates must all pass, matching the ChatGPT-review
     finding that a raw STOP alone is not enough evidence (this is the fix
     for the CNGA3/Phyllostomus discolor overfitting regression -- a single
     early frameshift there produced many downstream raw STOP triplets that
@@ -230,27 +253,57 @@ def build_stop_registry(gene: str, raw_stops: List[dict], canonical_source: Dict
        '!' placeholder or gap wedged between them). A non-contiguous mapping
        means the "codon" spans a structurally disturbed region and cannot
        be trusted as a clean lesion.
-    3. ``codon_confirmed`` -- the actual homologous codon read directly from
+    3. ``codon_frame_aligned`` -- the mapped span actually starts on a real
+       codon boundary of the canonical alignment's ONE shared codon frame
+       (column 1 = the first base of codon 1, column 4 = the first base of
+       codon 2, and so on for every species alike -- this is the same frame
+       every other codon-level operation in the pipeline, e.g. codon_to_aa/
+       aa_alignment(), already assumes). Real bug, found on real CNGA3 data
+       (reported directly by the user): gate 1 alone is not sufficient. A
+       species can have upstream MACSE markers whose LENGTHS sum to a
+       multiple of 3 (so gate 1 calls the frame "restored") while still
+       shifting which RAW nucleotides fall into which codon NUMBER from
+       that point on, because the raw premature-stop scanner
+       (00_prune_and_check_orf.py) numbers codons by counting from raw
+       position 1 with no knowledge of any correction. "Raw codon 18" and
+       "the alignment's actual codon 18" can therefore be two different,
+       non-overlapping spans once an odd number of markers happens to
+       total a multiple of 3 in aggregate. Confirmed directly on real data:
+       CNGA3/Phyllostomus_discolor's raw-scanner-reported codon 18 mapped
+       to alignment columns 53-55 -- NOT a codon boundary (52 is not a
+       multiple of 3) -- and reads as the last two bases of the alignment's
+       real codon 18 (translates to Valine) plus the first base of its real
+       codon 19 (Arginine): "TAA" purely by coincidence of an off-frame
+       window, not a real stop codon. Phyllostomus_discolor's own protein,
+       translated in its real, frame-aligned codons, matches its relatives
+       cleanly with no disruption at this position at all.
+    4. ``codon_confirmed`` -- the actual homologous codon read directly from
        the canonical alignment at those columns is still exactly
        TAA/TAG/TGA. This re-derives the codon from the FINAL alignment
        (after conserved-block/frame corrections) rather than trusting the
        RAW pre-alignment codon text unconditionally.
     """
     mapped = []
+    raw_to_aln_by_species: Dict[str, Dict[int, int]] = {}
     for raw in raw_stops:
         species = raw["species"]
         seq = canonical_source.get(species)
-        if seq is None:
+        raw_seq = raw_by_species.get(species)
+        if seq is None or raw_seq is None:
             continue
-        cols = [raw_nt_to_alignment_column(seq, pos, macse_mode)
+        if species not in raw_to_aln_by_species:
+            raw_to_aln_by_species[species] = build_raw_to_alignment_map(seq, raw_seq)
+        raw_to_aln = raw_to_aln_by_species[species]
+        cols = [raw_to_aln.get(pos)
                 for pos in range(raw["raw_nt_start"], raw["raw_nt_end"] + 1)]
         valid = all(col is not None for col in cols)
         contiguous = valid and cols == list(range(cols[0], cols[0] + len(cols)))
         aligned_start = min(cols) if valid else None
         aligned_end = max(cols) if valid else None
         clean_span = bool(contiguous and valid and aligned_end - aligned_start + 1 == 3)
+        frame_aligned = bool(clean_span and (aligned_start - 1) % 3 == 0)
         corrected_codon = seq[aligned_start - 1:aligned_end].upper() if clean_span else None
-        codon_confirmed = bool(clean_span and corrected_codon in STOPS)
+        codon_confirmed = bool(frame_aligned and corrected_codon in STOPS)
         independent = not raw["frame_shifted_at_stop"]
         candidate = bool(independent and valid and codon_confirmed)
         if not independent:
@@ -259,6 +312,8 @@ def build_stop_registry(gene: str, raw_stops: List[dict], canonical_source: Dict
             reason = "raw_premature_stop_could_not_be_mapped_to_canonical_alignment"
         elif not clean_span:
             reason = "raw_premature_stop_non_contiguous_or_non_3bp_mapping_uncertain"
+        elif not frame_aligned:
+            reason = "raw_premature_stop_mapped_span_does_not_start_on_a_real_codon_boundary"
         elif not codon_confirmed:
             reason = "raw_premature_stop_corrected_homologous_codon_is_not_a_stop"
         else:
@@ -278,6 +333,7 @@ def build_stop_registry(gene: str, raw_stops: List[dict], canonical_source: Dict
             "pseudogenizing_event_candidate": candidate,
             "independent_stop_candidate": candidate,
             "mapped_columns_contiguous": contiguous,
+            "codon_frame_aligned": frame_aligned,
             "codon_confirmed_stop": codon_confirmed,
             "frame_shifted_at_stop": raw["frame_shifted_at_stop"],
             "upstream_macse_marker_count": raw["upstream_macse_marker_count"],
@@ -290,6 +346,67 @@ def build_stop_registry(gene: str, raw_stops: List[dict], canonical_source: Dict
             ),
         })
     return mapped
+
+
+def scan_defined_stops(gene: str, native: Dict[str, str], order: List[str],
+                       coordinate_system: str) -> List[dict]:
+    """--alignment defined: detect premature stops by reading the authoritative
+    codon alignment directly, with no MACSE and no raw->alignment remapping.
+
+    The alignment length is a multiple of three (already validated), so every
+    codon is simply a consecutive column triplet -- the same thing as running
+    ``fold -w 3`` on each row, which never masks a TAA/TAG/TGA that straddles a
+    codon boundary because there is no boundary to straddle here: column 1 is
+    the first base of codon 1 for every species alike. For each species we walk
+    those codons, skip its own terminal codon (the terminal stop was already
+    removed by gapping in step 00, but we guard against any that remain), and
+    record every in-frame TAA/TAG/TGA at its exact alignment columns as an
+    independent premature-stop candidate. Because these coordinates are read
+    straight off the canonical alignment, the four MACSE-era gates
+    (frame-phase, contiguity, codon-frame, codon-confirmation) are all
+    satisfied by construction, so each is reported as already met.
+    """
+    length = len(next(iter(native.values())))
+    rows: List[dict] = []
+    for species in order:
+        seq = native[species].upper()
+        last_nongap = max((i for i, ch in enumerate(seq) if ch != "-"), default=-1)
+        terminal_codon_idx = last_nongap // 3 if last_nongap >= 0 else -1
+        for col0 in range(0, length, 3):
+            codon = seq[col0:col0 + 3]
+            if codon not in STOPS:
+                continue
+            codon_idx = col0 // 3
+            is_terminal = codon_idx == terminal_codon_idx
+            start, end = col0 + 1, col0 + 3
+            rows.append({
+                "gene": gene,
+                "species": species,
+                "codon_position": codon_idx + 1,
+                "nt_start": "NA",
+                "nt_end": "NA",
+                "primary_alignment_start": start,
+                "primary_alignment_end": end,
+                "stop_codon": codon,
+                "corrected_homologous_codon": codon,
+                "coordinate_system": coordinate_system,
+                "terminal_codon": is_terminal,
+                "pseudogenizing_event_candidate": (not is_terminal),
+                "independent_stop_candidate": (not is_terminal),
+                "mapped_columns_contiguous": True,
+                "codon_frame_aligned": True,
+                "codon_confirmed_stop": True,
+                "frame_shifted_at_stop": "NA",
+                "upstream_macse_marker_count": "NA",
+                "upstream_macse_frame_correction_mod3": "NA",
+                "stop_phase_interpretation": "defined_alignment_direct_codon_scan",
+                "reason": (
+                    "defined_alignment_terminal_stop_masked_for_paml_only" if is_terminal
+                    else "defined_alignment_inframe_stop_masked_as_independent_candidate"
+                ),
+                "stop_event_key": f"{start}-{end}:{codon}",
+            })
+    return rows
 
 
 def mask_paml_stops(paml: Dict[str, str], order: List[str], registry: List[dict],
@@ -319,6 +436,7 @@ def mask_paml_stops(paml: Dict[str, str], order: List[str], registry: List[dict]
                     "pseudogenizing_event_candidate": False,
                     "independent_stop_candidate": False,
                     "mapped_columns_contiguous": True,
+                    "codon_frame_aligned": True,
                     "codon_confirmed_stop": True,
                     "frame_shifted_at_stop": "NA",
                     "upstream_macse_marker_count": "NA",
@@ -360,8 +478,6 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     user, user_order = read_fasta(r0 / f"00_{gene}.common_species.fasta")
-    canonical_nt_name = f"01_{gene}.macse_NT.fasta"
-    macse, macse_order = read_fasta(r1 / canonical_nt_name)
     tree = Phylo.read(str(r0 / f"00_{gene}.common_species.tree"), "newick")
     def terminals_top_to_bottom(clade):
         if not clade.clades:
@@ -376,6 +492,8 @@ def main() -> None:
         raise SystemExit("Step02 species mismatch between pruned FASTA and pruned tree")
 
     if args.alignment_mode == "perform":
+        canonical_nt_name = f"01_{gene}.macse_NT.fasta"
+        macse, macse_order = read_fasta(r1 / canonical_nt_name)
         if set(macse) != set(user):
             raise SystemExit(
                 f"MACSE output species differ from pruned input: missing={sorted(set(user)-set(macse))[:10]}, "
@@ -387,7 +505,6 @@ def main() -> None:
         paml_pre = {name: macse[name].replace("!", "N") for name in order}
         coordinate_system = "macse_codon_alignment"
         source_path = r1 / canonical_nt_name
-        macse_mode = True
     else:
         validate_equal_alignment(user, order, ALLOWED_DEFINED, "user-defined alignment")
         canonical_source = {name: user[name] for name in order}
@@ -395,13 +512,19 @@ def main() -> None:
         paml_pre = dict(canonical_source)
         coordinate_system = "user_defined_codon_alignment"
         source_path = r0 / f"00_{gene}.common_species.fasta"
-        macse_mode = False
 
     length = validate_equal_alignment(native, order, ALLOWED_DEFINED, "native canonical alignment")
     validate_equal_alignment(paml_pre, order, ALLOWED_DEFINED, "PAML pre-mask alignment")
 
-    raw_stops = load_raw_stop_diagnostics(r0, r1, gene)
-    stop_registry = build_stop_registry(gene, raw_stops, canonical_source, macse_mode, coordinate_system)
+    if args.alignment_mode == "perform":
+        # MACSE ran: join raw STOP calls to MACSE frame-phase diagnostics and
+        # remap them into canonical coordinates through the four validation gates.
+        raw_stops = load_raw_stop_diagnostics(r0, r1, gene)
+        stop_registry = build_stop_registry(gene, raw_stops, canonical_source, user, coordinate_system)
+    else:
+        # --alignment defined: no MACSE. Read premature stops straight off the
+        # authoritative codon alignment (see scan_defined_stops).
+        stop_registry = scan_defined_stops(gene, native, order, coordinate_system)
     paml_safe, technical_stops = mask_paml_stops(paml_pre, order, stop_registry, gene, coordinate_system)
     all_stops = stop_registry + technical_stops
 
@@ -422,7 +545,6 @@ def main() -> None:
     write_fasta(native, out / f"02_{gene}.primary_codon_alignment_native.fasta", order)
     write_fasta(paml_safe, out / f"02_{gene}.primary_codon_alignment.fasta", order)
     write_fasta(paml_safe, out / f"02_{gene}.nt_alignment.fasta", order)
-    write_fasta(native, out / f"02_{gene}.nt_for_indelmap.fasta", order)
     write_fasta(aa, out / f"02_{gene}.primary_AA_alignment.fasta", order)
     write_phylip(paml_safe, out / f"02_{gene}.codon_for_paml.phy", order)
     Phylo.write(tree, str(out / f"02_{gene}.tree_for_asr.nwk"), "newick")
@@ -431,7 +553,7 @@ def main() -> None:
         "gene", "species", "codon_position", "nt_start", "nt_end",
         "primary_alignment_start", "primary_alignment_end", "stop_codon", "corrected_homologous_codon",
         "coordinate_system", "terminal_codon", "pseudogenizing_event_candidate", "independent_stop_candidate",
-        "mapped_columns_contiguous", "codon_confirmed_stop", "frame_shifted_at_stop", "upstream_macse_marker_count",
+        "mapped_columns_contiguous", "codon_frame_aligned", "codon_confirmed_stop", "frame_shifted_at_stop", "upstream_macse_marker_count",
         "upstream_macse_frame_correction_mod3", "stop_phase_interpretation", "reason", "stop_event_key",
     ])
     write_tsv(frame_rows, out / f"02_{gene}.macse_frameshift_placeholders.tsv", [
@@ -448,17 +570,22 @@ def main() -> None:
         "n_species": len(order),
         "defined_alignment_columns_modified": False,
         "second_alignment_performed": False,
-        "paml_stop_masking": "exact STOPs -> NNN; raw premature STOP coordinates retained",
+        "premature_stop_detection": (
+            "macse_raw_stop_remap_with_four_gates" if args.alignment_mode == "perform"
+            else "direct_codon_frame_scan_of_defined_alignment_no_macse"
+        ),
+        "paml_stop_masking": "exact STOPs -> NNN; premature STOP alignment coordinates retained",
     }], out / f"02_{gene}.alignment_provenance.tsv")
     write_tsv([
         {"alignment_site": i, "codon_site": (i + 2) // 3, "coordinate_system": coordinate_system}
         for i in range(1, length + 1)
     ], out / f"02_{gene}.primary_site_map.tsv")
 
+    n_candidate_stops = sum(1 for r in stop_registry if trueish(r.get("pseudogenizing_event_candidate")))
     print(
         f"Finished step02 for {gene}; mode={args.alignment_mode}; canonical={coordinate_system}; "
         f"species={len(order)}; columns={length}; MACSE_placeholders={len(frame_rows)}; "
-        f"raw_premature_stops={len(stop_registry)}"
+        f"premature_stops_registered={len(stop_registry)}; independent_stop_candidates={n_candidate_stops}"
     )
 
 

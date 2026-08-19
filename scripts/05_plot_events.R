@@ -40,6 +40,7 @@ gene       <- get_arg("--gene")
 tree_file  <- get_arg("--tree")
 events_file<- get_arg("--events")
 orf_file   <- get_arg("--orf-transitions", NA_character_)
+orf_status_file <- get_arg("--orf-status", NA_character_)
 outdir     <- get_arg("--outdir", ".")
 dated      <- is_yes(get_arg("--dated", "yes"))
 aln_len_arg<- get_arg("--alignment-length", NA_character_)
@@ -57,8 +58,8 @@ tipfont_arg<- get_arg("--tip-font", "auto")
 # "--xxx"-shaped token that isn't one of the flags this script recognises so
 # a bad flag name fails loudly here instead of silently producing a wrong,
 # uniformly grey plot.
-known_flags <- c("--gene", "--tree", "--events", "--orf-transitions", "--outdir",
-                  "--dated", "--alignment-length", "--min-sites", "--show-tips",
+known_flags <- c("--gene", "--tree", "--events", "--orf-transitions", "--orf-status",
+                  "--outdir", "--dated", "--alignment-length", "--min-sites", "--show-tips",
                   "--width", "--height", "--tip-font")
 flag_positions <- grep("^--", args)
 unknown_flags <- setdiff(args[flag_positions], known_flags)
@@ -71,6 +72,8 @@ if (is.na(tree_file) || is.na(events_file)) stop("--tree and --events are requir
 for (f in c(tree_file, events_file)) if (!file.exists(f)) stop("File not found: ", f)
 if (!is.na(orf_file) && !file.exists(orf_file))
   stop("--orf-transitions file not found: ", orf_file)
+if (!is.na(orf_status_file) && !file.exists(orf_status_file))
+  stop("--orf-status file not found: ", orf_status_file)
 dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
 
 read_tsv_base <- function(path) {
@@ -165,6 +168,7 @@ orf_display_map <- c(
   sequence_disruption_first_loss_unresolved = "pseudogenization",
   already_pseudogenic = "already_pseudogenic",
   apparent_orf_restoration = "intact",
+  partial = "partial",
   ambiguous_disabling_event = "uncertain",
   sequence_state_uncertain = "uncertain",
   history_uncertain_no_confirmed_event = "uncertain",
@@ -175,6 +179,7 @@ orf_display_map <- c(
 orf_colours <- c(
   pseudogenization = "#c0392b",
   already_pseudogenic = "#e8a6a0",
+  partial = "#e67e22",
   uncertain = "#d68910",
   unavailable = "grey80",
   intact = "grey55",
@@ -182,6 +187,17 @@ orf_colours <- c(
 )
 edge_df$orf_class <- ifelse(edge_df$orf_class_detail %in% names(orf_display_map),
                             orf_display_map[edge_df$orf_class_detail], "unknown")
+
+# ---------------------------------------------------------- start-codon status
+# A species whose own CDS does not begin with an ATG start codon is flagged at
+# its tip with a small red X. This is read straight from step 00's per-species
+# ORF audit (00_<gene>.orf_status.tsv, column starts_with_atg), which is
+# computed the same way in both --alignment perform and --alignment defined, so
+# the marker means the same thing in both modes. Absent file => no markers.
+no_start_tips <- character(0)
+orf_status <- read_tsv_base(orf_status_file)
+if (nrow(orf_status) > 0 && all(c("species", "starts_with_atg") %in% names(orf_status)))
+  no_start_tips <- orf_status$species[!to_bool(orf_status$starts_with_atg)]
 
 # ---------------------------------------------------------------- sizing
 max_chars <- if (show_tips) max(nchar(gsub("_", " ", tr$tip.label))) else 0
@@ -206,6 +222,7 @@ label_w <- if (denom > 0.2) label_in * (2 * tree_w + 2 * gap) / denom else tree_
 # node" (shared, non-disrupting indels only -- an ambiguous or disabling
 # event keeps its own category regardless of where it originates).
 mc_len3 <- suppressWarnings(as.numeric(ev$length_mod_3))
+is_terminal_incomplete <- if ("terminal_incompleteness" %in% names(ev)) to_bool(ev$terminal_incompleteness) else rep(FALSE, nrow(ev))
 is_stop_gain          <- ev$character_class == "stop_mask" & ev$biological_interpretation == "premature_stop_gained"
 is_stop_lost           <- ev$character_class == "stop_mask" & ev$biological_interpretation == "premature_stop_lost"
 is_frameshift_indel   <- ev$character_class == "indel" & !is.na(mc_len3) & mc_len3 != 0
@@ -227,7 +244,17 @@ ev$marker_class[is_inframe_indel & is_insertion & is_ancestral_origin] <- "share
 ev$marker_class[is_inframe_indel & is_deletion & is_ancestral_origin]  <- "shared_inframe_deletion"
 ev$marker_class[is_ambiguous_disabling] <- "ambiguous_disabling_candidate"
 ev$marker_class[is_stop_lost] <- "stop_lost_reversion"
-ev$marker_class[is_frameshift_indel & !is_ambiguous_disabling] <- "pseudogenizing_indel"
+# Frameshift indels are split by direction into insertion vs deletion so the two
+# read as distinct on the figure (both still disabling, both still non-red so
+# they stay visible on top of a red branch). Only frameshift indels with a
+# confident direction land here; an ambiguous_indel_change was already routed to
+# ambiguous_disabling_candidate above.
+ev$marker_class[is_frameshift_indel & !is_ambiguous_disabling & is_insertion] <- "frameshift_insertion"
+ev$marker_class[is_frameshift_indel & !is_ambiguous_disabling & is_deletion]  <- "frameshift_deletion"
+# A frameshift-length indel at the very 5'/3' end is truncation, not a disabling
+# lesion (it drives the branch's "partial" call, not pseudogenization), so it is
+# drawn as a muted terminal-incompleteness marker rather than a bold frameshift.
+ev$marker_class[is_frameshift_indel & is_terminal_incomplete] <- "terminal_incomplete"
 ev$marker_class[is_stop_gain] <- "pseudogenizing_substitution"
 
 # Deliberately NOT red: pseudogenizing markers can sit directly on top of
@@ -239,28 +266,53 @@ ev$marker_class[is_stop_gain] <- "pseudogenizing_substitution"
 # not read as important; it deliberately does not try to stand out.
 marker_colours <- c(
   pseudogenizing_substitution = "#17202a",
-  pseudogenizing_indel = "#f1c40f",
+  frameshift_insertion = "#8e44ad",
+  frameshift_deletion = "#f1c40f",
   ambiguous_disabling_candidate = "#d68910",
   stop_lost_reversion = "#16a085",
+  terminal_incomplete = "#c4a484",
   shared_inframe_insertion = "#2471a3",
   shared_inframe_deletion = "#bdb76b",
   other = "grey75"
 )
 marker_labels <- c(
   pseudogenizing_substitution = "Pseudogenizing substitution (premature stop)",
-  pseudogenizing_indel = "Frameshift indel",
+  frameshift_insertion = "Frameshift insertion",
+  frameshift_deletion = "Frameshift deletion",
   ambiguous_disabling_candidate = "Ambiguous disabling candidate (uncertain origin/direction)",
   stop_lost_reversion = "Premature stop lost (reversion)",
+  terminal_incomplete = "Terminal indel (incompleteness, not disabling)",
   shared_inframe_insertion = "Shared in-frame insertion (ancestral, non-disrupting)",
   shared_inframe_deletion = "Shared in-frame deletion (ancestral, non-disrupting)",
   other = "Other event (e.g. lineage-specific in-frame indel)"
 )
+orf_labels <- c(
+  pseudogenization = "Confirmed disabling event",
+  already_pseudogenic = "Inherited pseudogenic history",
+  partial = "Incomplete; no pseudogenization evidence",
+  uncertain = "Uncertain; no confirmed event",
+  unavailable = "Sequence unavailable",
+  intact = "No inferred disabling history",
+  unknown = "No ancestral sequence")
+
+# The legends are FIXED and complete: every event-marker category and every
+# pseudogenization-history category is shown on every figure, whether or not it
+# happens to occur in a given gene's events. This keeps the figure legends
+# identical and directly comparable across genes and across --alignment perform
+# vs --alignment defined runs (a small synthetic gene and a large real gene get
+# the same, full legend), instead of a data-dependent subset. Order is the fixed
+# order these vectors are declared in.
+marker_legend_order <- names(marker_colours)
+orf_legend_order <- names(orf_colours)
 
 subtitle <- paste0(nrow(ev), " events on ", length(unique(ev$branch)), " branches; ",
                    sum(ev$shared_event), " shared; ", ntip, " tips; ",
                    aln_len, " alignment columns",
                    if (any(ev$ambiguous_origin)) paste0("; ", sum(ev$ambiguous_origin),
-                                                        " with an exact parsimony tie") else "")
+                                                        " with an exact parsimony tie") else "",
+                   if (length(no_start_tips) > 0)
+                     paste0("; red X at tip = no ATG start codon (", length(no_start_tips), ")")
+                   else "")
 
 base_tree <- function(p) {
   p + geom_segment(data = edge_df, aes(x = parent_x, xend = parent_x, y = parent_y, yend = child_y),
@@ -273,6 +325,7 @@ base_tree <- function(p) {
 
 tip_df <- coord[coord$isTip, , drop = FALSE]
 tip_df$plot_label <- gsub("_", " ", tip_df$label)
+tip_df$no_start <- tip_df$label %in% no_start_tips
 # A species NAME is red/bold exactly when its own branch renders as
 # pseudogenized (the same collapsed orf_class driving branch colour above),
 # not raw known_pseudogenic_history -- that flag stays TRUE for
@@ -281,6 +334,10 @@ tip_df$plot_label <- gsub("_", " ", tip_df$label)
 # with its own branch rather than silently contradict it.
 broken_tips <- edge_df$child_label[edge_df$orf_class %in% c("pseudogenization", "already_pseudogenic")]
 tip_df$broken <- tip_df$label %in% broken_tips
+# A partial tip (incomplete but no pseudogenization evidence) gets an orange
+# label matching its orange branch; it is deliberately NOT in broken_tips.
+partial_tips <- edge_df$child_label[edge_df$orf_class == "partial"]
+tip_df$partial <- (tip_df$label %in% partial_tips) & !tip_df$broken
 
 time_breaks <- pretty(c(0, tree_w), n = 6); time_breaks <- time_breaks[time_breaks >= 0 & time_breaks <= tree_w]
 
@@ -329,26 +386,27 @@ if (nrow(event_nodes) > 0)
                         label.size = 0.15, label.padding = grid::unit(0.08, "lines"))
 if (show_tips)
   p1 <- p1 +
-    geom_text(data = tip_df[!tip_df$broken, , drop = FALSE], aes(x = tree_w + gap, y = y, label = plot_label),
+    geom_text(data = tip_df[!tip_df$broken & !tip_df$partial, , drop = FALSE], aes(x = tree_w + gap, y = y, label = plot_label),
               hjust = 0, size = tip_font, colour = "grey25", fontface = "italic") +
+    geom_text(data = tip_df[tip_df$partial, , drop = FALSE], aes(x = tree_w + gap, y = y, label = plot_label),
+              hjust = 0, size = tip_font, colour = "#e67e22", fontface = "bold.italic") +
     geom_text(data = tip_df[tip_df$broken, , drop = FALSE], aes(x = tree_w + gap, y = y, label = plot_label),
               hjust = 0, size = tip_font, colour = "#c0392b", fontface = "bold.italic")
+# Small red X at the tip of any species whose CDS lacks an ATG start codon.
+# Drawn last so it sits on top of the branch, at the tip's own branch end.
+nostart_df <- tip_df[tip_df$no_start, , drop = FALSE]
+if (nrow(nostart_df) > 0)
+  p1 <- p1 + geom_point(data = nostart_df, aes(x = x, y = y), shape = 4,
+                        colour = "#c0392b", size = max(1.6, tip_font * 0.95), stroke = 0.8)
 
 p1 <- p1 +
   scale_colour_manual(name = "Pseudogenization history", values = orf_colours,
-                      breaks = names(orf_colours)[names(orf_colours) %in% edge_df$orf_class],
-                      labels = c(
-                        pseudogenization = "Confirmed disabling event",
-                        already_pseudogenic = "Inherited pseudogenic history",
-                        uncertain = "Uncertain; no confirmed event",
-                        unavailable = "Sequence unavailable",
-                        intact = "No inferred disabling history",
-                        unknown = "No ancestral sequence")[
-                        names(orf_colours)[names(orf_colours) %in% edge_df$orf_class]]) +
+                      breaks = orf_legend_order, limits = orf_legend_order, drop = FALSE,
+                      labels = orf_labels[orf_legend_order]) +
   scale_fill_manual(name = "Event marker", values = marker_colours,
-                    breaks = names(marker_colours)[names(marker_colours) %in% ev1$marker_class],
-                    labels = marker_labels[names(marker_colours)[names(marker_colours) %in% ev1$marker_class]]) +
-  guides(fill = guide_legend(order = 1, nrow = 2, byrow = TRUE, title.position = "top"),
+                    breaks = marker_legend_order, limits = marker_legend_order, drop = FALSE,
+                    labels = marker_labels[marker_legend_order]) +
+  guides(fill = guide_legend(order = 1, nrow = 3, byrow = TRUE, title.position = "top"),
         colour = guide_legend(order = 2, nrow = 2, byrow = TRUE, title.position = "top")) +
   scale_x_continuous(name = if (dated) "Time before present" else "Node depth",
                      breaks = time_breaks,
@@ -427,11 +485,11 @@ p2 <- base_tree(p2) +
   geom_rect(data = ev2, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax,
                             fill = marker_class), colour = NA) +
   scale_fill_manual(name = "Event marker", values = marker_colours,
-                    breaks = names(marker_colours)[names(marker_colours) %in% ev2$marker_class],
-                    labels = marker_labels[names(marker_colours)[names(marker_colours) %in% ev2$marker_class]]) +
+                    breaks = marker_legend_order, limits = marker_legend_order, drop = FALSE,
+                    labels = marker_labels[marker_legend_order]) +
   scale_colour_manual(name = "Pseudogenization history", values = orf_colours,
-                      breaks = names(orf_colours)[names(orf_colours) %in% edge_df$orf_class], guide = "none") +
-  guides(fill = guide_legend(nrow = 2, byrow = TRUE, title.position = "top"))
+                      breaks = orf_legend_order, limits = orf_legend_order, drop = FALSE, guide = "none") +
+  guides(fill = guide_legend(nrow = 3, byrow = TRUE, title.position = "top"))
 # Every internal node, not just event-carrying ones: on a 100+ tip tree the
 # unlabelled backbone made it impossible to tell which branch in the event
 # map corresponds to which node in alignment_events.tsv/
@@ -446,10 +504,15 @@ p2 <- p2 +
             label.size = 0.1, label.padding = grid::unit(0.08, "lines"), alpha = 0.9)
 if (show_tips)
   p2 <- p2 +
-    geom_text(data = tip_df[!tip_df$broken, , drop = FALSE], aes(x = tree_w + gap, y = y, label = plot_label),
+    geom_text(data = tip_df[!tip_df$broken & !tip_df$partial, , drop = FALSE], aes(x = tree_w + gap, y = y, label = plot_label),
               hjust = 0, size = tip_font, colour = "grey25", fontface = "italic") +
+    geom_text(data = tip_df[tip_df$partial, , drop = FALSE], aes(x = tree_w + gap, y = y, label = plot_label),
+              hjust = 0, size = tip_font, colour = "#e67e22", fontface = "bold.italic") +
     geom_text(data = tip_df[tip_df$broken, , drop = FALSE], aes(x = tree_w + gap, y = y, label = plot_label),
               hjust = 0, size = tip_font, colour = "#c0392b", fontface = "bold.italic")
+if (nrow(nostart_df) > 0)
+  p2 <- p2 + geom_point(data = nostart_df, aes(x = x, y = y), shape = 4,
+                        colour = "#c0392b", size = max(1.6, tip_font * 0.95), stroke = 0.8)
 
 p2 <- p2 +
   annotate("text", x = tree_w / 2, y = ntip + 2.4, label = if (dated) "Dated tree" else "Cladogram",

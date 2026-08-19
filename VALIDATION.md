@@ -143,7 +143,6 @@ Real external-program biological runs were not available here:
 
 - real MACSE executable;
 - real codeml executable;
-- real IndelMaP;
 - R/ggplot2 plotting runtime.
 
 Accordingly:
@@ -160,7 +159,7 @@ This smoke suite is deliberately stronger than v3.25's because it exercises the 
 Before launching all genes, run at least:
 
 1. GUCA1B, manually checking 646-687, 688-696 and Nycteris 661-669;
-2. PDE6H, manually checking the known shared premature STOP pattern and ensuring an IndelMaP failure (if reproduced) does not stop core output;
+2. PDE6H, manually checking the known shared premature STOP pattern;
 3. one `--alignment defined` gene to verify the curated alignment is retained exactly.
 
 Any discrepancy should be treated as a regression and added to `tests/` before another package revision.

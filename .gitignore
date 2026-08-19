@@ -1,7 +1,3 @@
-# IndelMaP is a third-party dependency install.sh clones fresh for each user;
-# it is not part of the Pensieve package itself.
-external/indelMaP/
-
 # Local run output -- not part of the distributed package.
 results_00/
 results_01/

@@ -6,10 +6,10 @@ PROGRAM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 GENE=""; FASTA=""; TREE=""; WORKDIR="$PWD"; THREADS=8; TIME_HOURS=96
 ALIGNMENT="perform"; DATED="yes"; RUN_FROM_STEP="AUTO"; RUN_UP_TO="FULL"
-CLEAN=0; SKIP_PLOT=0; PAML_MODE="local"; DAT_DIR="$PROGRAM_DIR/dat"
-INDELMAP_DIR="$PROGRAM_DIR/external/indelMaP"; RUN_INDELMAP="no"; ENV_NAME="Pensieve"
+CLEAN=0; SKIP_PLOT=0; PAML_MODE="local"; DAT_DIR="$PROGRAM_DIR/dat"; ENV_NAME="Pensieve"
 TIE_BREAK="none"; BREAKPOINT_TOLERANCE="0"; ON_MISSING_ROOT_SEQUENCE="warn"
 ORF_LOSS_COST="1.0"; ORF_RESTORATION_COST="2.0"; PSEUDOGENIC_BOUNDARY_CAP_VOTES="2.0"
+MIN_FUNCTIONAL_WITNESSES="2"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -27,8 +27,8 @@ while [[ $# -gt 0 ]]; do
     --skip-plot) SKIP_PLOT=1; shift;;
     --paml-mode) PAML_MODE="$2"; shift 2;;
     --dat-dir) DAT_DIR="$2"; shift 2;;
-    --indelmap-dir) INDELMAP_DIR="$2"; shift 2;;
-    --indelmap) RUN_INDELMAP="$2"; shift 2;;
+    --indelmap|--indelmap-dir) shift 2;;   # removed; accepted and ignored for back-compat
+    --min-functional-witnesses) MIN_FUNCTIONAL_WITNESSES="$2"; shift 2;;
     --env-name) ENV_NAME="$2"; shift 2;;
     --tie-break) TIE_BREAK="$2"; shift 2;;
     --breakpoint-tolerance) BREAKPOINT_TOLERANCE="$2"; shift 2;;
@@ -44,7 +44,6 @@ done
 [[ "$TIME_HOURS" =~ ^[1-9][0-9]*$ ]] || { echo "[ERROR] --time must be a positive integer" >&2; exit 1; }
 case "$ALIGNMENT" in perform|defined) ;; *) echo "[ERROR] --alignment perform|defined" >&2; exit 1;; esac
 case "$DATED" in yes|no) ;; *) echo "[ERROR] --dated yes|no" >&2; exit 1;; esac
-case "$RUN_INDELMAP" in yes|no|auto) ;; *) echo "[ERROR] --indelmap yes|no|auto" >&2; exit 1;; esac
 case "$TIE_BREAK" in none|ancestral|terminal) ;; *) echo "[ERROR] --tie-break none|ancestral|terminal" >&2; exit 1;; esac
 case "$PAML_MODE" in
   local|same) ;;
@@ -89,9 +88,9 @@ clean_from(){
   case "$RUN_FROM_STEP" in
     diagnostics) rm -rf "results_00/$GENE" "results_01/$GENE" "results_02/$GENE" "results_03/$GENE" "final_results/$GENE";;
     alignment) rm -rf "results_02/$GENE" "results_03/$GENE" "final_results/$GENE";;
-    events) rm -rf "results_03/$GENE" "final_results/$GENE"; rm -rf "results_02/$GENE/paml_codon_asr" "results_02/$GENE/indelmap_asr";;
-    asr) rm -rf "results_02/$GENE/paml_codon_asr" "results_02/$GENE/indelmap_asr"; find "results_03/$GENE" -maxdepth 1 -type f ! -name "03_${GENE}.alignment_*" ! -name "03_${GENE}.frame_arithmetic_by_node.tsv" ! -name "03_${GENE}.pensieve_labelled_dated_tree.nwk" ! -name "03_${GENE}.internode_label_map.tsv" -delete 2>/dev/null || true; rm -rf "final_results/$GENE";;
-    integrate) find "results_03/$GENE" -maxdepth 1 -type f \( -name "03_${GENE}.paml*" -o -name "03_${GENE}.ancestral*" -o -name "03_${GENE}.internode_label_crosswalk.tsv" -o -name "03_${GENE}.tree_topology*" -o -name "03_${GENE}.indelmap_concordance*" -o -name "04_${GENE}.*" \) -delete 2>/dev/null || true; rm -rf "final_results/$GENE";;
+    events) rm -rf "results_03/$GENE" "final_results/$GENE"; rm -rf "results_02/$GENE/paml_codon_asr";;
+    asr) rm -rf "results_02/$GENE/paml_codon_asr"; find "results_03/$GENE" -maxdepth 1 -type f ! -name "03_${GENE}.alignment_*" ! -name "03_${GENE}.frame_arithmetic_by_node.tsv" ! -name "03_${GENE}.pensieve_labelled_dated_tree.nwk" ! -name "03_${GENE}.internode_label_map.tsv" -delete 2>/dev/null || true; rm -rf "final_results/$GENE";;
+    integrate) find "results_03/$GENE" -maxdepth 1 -type f \( -name "03_${GENE}.paml*" -o -name "03_${GENE}.ancestral*" -o -name "03_${GENE}.internode_label_crosswalk.tsv" -o -name "03_${GENE}.tree_topology*" -o -name "04_${GENE}.*" \) -delete 2>/dev/null || true; rm -rf "final_results/$GENE";;
     plot) rm -rf "final_results/$GENE";;
   esac
 }
@@ -99,7 +98,11 @@ clean_from(){
 require_diagnostics(){
   require_file "results_00/$GENE/00_${GENE}.common_species.fasta" step00_common_fasta
   require_file "results_00/$GENE/00_${GENE}.orf_status.tsv" step00_orf_status
-  require_file "results_01/$GENE/01_${GENE}.macse_NT.fasta" step01_macse_nt
+  # --alignment defined does not run MACSE at all, so its NT alignment is not a
+  # prerequisite; the supplied codon alignment is used directly in step 02.
+  if [[ "$ALIGNMENT" == "perform" ]]; then
+    require_file "results_01/$GENE/01_${GENE}.macse_NT.fasta" step01_macse_nt
+  fi
 }
 require_alignment(){
   require_file "results_02/$GENE/02_${GENE}.primary_codon_alignment_native.fasta" native_alignment
@@ -150,9 +153,9 @@ copy_final_outputs(){
   copy_if_exists "results_03/$GENE/03_${GENE}.ancestral_native_cds.fa" "$important/${GENE}.ancestral_native_cds.fa"
   copy_if_exists "results_03/$GENE/03_${GENE}.phylogenetic_sequence_order.tsv" "$important/${GENE}.phylogenetic_sequence_order.tsv"
   copy_if_exists "results_00/$GENE/00_${GENE}.phylogenetic_tip_order.tsv" "$important/${GENE}.phylogenetic_tip_order.tsv"
+  copy_if_exists "results_00/$GENE/00_${GENE}.orf_status.tsv" "$important/${GENE}.orf_status.tsv"
   copy_if_exists "results_03/$GENE/03_${GENE}.pensieve_labelled_dated_tree.nwk" "$important/${GENE}.pensieve_tree.nwk"
   copy_if_exists "results_03/$GENE/03_${GENE}.internode_label_crosswalk.tsv" "$important/${GENE}.internode_label_crosswalk.tsv"
-  copy_if_exists "results_03/$GENE/03_${GENE}.indelmap_concordance.tsv" "$important/${GENE}.indelmap_concordance.tsv"
   copy_if_exists "results_02/$GENE/02_${GENE}.primary_codon_alignment_native.fasta" "$important/${GENE}.canonical_alignment.fasta"
   copy_if_exists "results_02/$GENE/02_${GENE}.primary_codon_alignment.fasta" "$support/${GENE}.paml_safe_alignment.fasta"
   copy_if_exists "results_02/$GENE/02_${GENE}.alignment_provenance.tsv" "$support/${GENE}.alignment_provenance.tsv"
@@ -188,15 +191,19 @@ mkdir -p "results_00/$GENE" "results_01/$GENE" "results_02/$GENE" "results_03/$G
 
 echo "============================================================"
 echo "Pensieve $(cat "$PROGRAM_DIR/VERSION") | GENE=$GENE | alignment=$ALIGNMENT | dated=$DATED"
-echo "range=$RUN_FROM_STEP->$RUN_UP_TO | indelmap=$RUN_INDELMAP | tie_break=$TIE_BREAK"
+echo "range=$RUN_FROM_STEP->$RUN_UP_TO | tie_break=$TIE_BREAK | min_functional_witnesses=$MIN_FUNCTIONAL_WITNESSES"
 echo "workdir=$WORKDIR | start=$(date)"
 echo "============================================================"
 
 if step_in_range diagnostics; then
-  echo "[$(date)] STEP diagnostics: prune/tree reconcile + raw ORF audit"
-  python "$SCRIPT_DIR/00_prune_and_check_orf.py" --gene "$GENE" --fasta "$FASTA" --tree "$TREE" --outdir "results_00/$GENE"
-  echo "[$(date)] STEP diagnostics: MACSE frameshift/STOP-aware alignment"
-  python "$SCRIPT_DIR/01_run_macse_and_extract_events.py" --gene "$GENE" --step00-dir "results_00/$GENE" --outdir "results_01/$GENE"
+  echo "[$(date)] STEP diagnostics: prune/tree reconcile + raw ORF audit (start-codon/ORF status)"
+  python "$SCRIPT_DIR/00_prune_and_check_orf.py" --gene "$GENE" --fasta "$FASTA" --tree "$TREE" --outdir "results_00/$GENE" --alignment-mode "$ALIGNMENT"
+  if [[ "$ALIGNMENT" == "perform" ]]; then
+    echo "[$(date)] STEP diagnostics: MACSE frameshift/STOP-aware alignment"
+    python "$SCRIPT_DIR/01_run_macse_and_extract_events.py" --gene "$GENE" --step00-dir "results_00/$GENE" --outdir "results_01/$GENE"
+  else
+    echo "[$(date)] STEP diagnostics: --alignment defined -> skipping MACSE; the supplied codon alignment is used directly"
+  fi
 elif prereq_needed diagnostics; then require_diagnostics; fi
 
 if step_in_range alignment; then
@@ -215,20 +222,21 @@ if step_in_range events; then
     --orf-status "results_00/$GENE/00_${GENE}.orf_status.tsv" \
     --orf-loss-cost "$ORF_LOSS_COST" --orf-restoration-cost "$ORF_RESTORATION_COST" \
     --pseudogenic-boundary-cap-votes "$PSEUDOGENIC_BOUNDARY_CAP_VOTES" \
+    --min-functional-witnesses "$MIN_FUNCTIONAL_WITNESSES" \
     --outdir "results_03/$GENE" --dated "$DATED" --tie-break "$TIE_BREAK" \
     --breakpoint-tolerance "$BREAKPOINT_TOLERANCE" --coordinate-system "canonical_codon_alignment"
 elif prereq_needed events; then require_events; fi
 
 if step_in_range asr; then
   require_alignment; require_events
-  echo "[$(date)] STEP asr: codeml substitution ASR + optional IndelMaP concordance backend"
+  echo "[$(date)] STEP asr: codeml substitution ASR"
   bash "$SCRIPT_DIR/02_run_asr_backends.sh" --gene "$GENE" --workdir "$WORKDIR" --threads "$THREADS" --time-hours "$TIME_HOURS" \
-    --paml-mode local --indelmap "$RUN_INDELMAP" --indelmap-dir "$INDELMAP_DIR" --env-name "$ENV_NAME"
+    --paml-mode local --env-name "$ENV_NAME"
 elif prereq_needed asr; then require_asr; fi
 
 if step_in_range integrate; then
   require_alignment; require_events; require_asr
-  echo "[$(date)] STEP integrate: parse/map PAML; compare optional IndelMaP without overwriting Pensieve states"
+  echo "[$(date)] STEP integrate: parse/map PAML marginal ASR onto Pensieve internodes"
   python "$SCRIPT_DIR/03_integrate_asr_evidence.py" --gene "$GENE" --results02-dir "results_02/$GENE" --results00-dir "results_00/$GENE" --outdir "results_03/$GENE" --dated "$DATED" --on-missing-root-sequence "$ON_MISSING_ROOT_SEQUENCE"
   echo "[$(date)] STEP integrate: build native ancestors and sticky pseudogenization history"
   python "$SCRIPT_DIR/04_ancestral_orf_walk.py" --gene "$GENE" \
@@ -254,6 +262,7 @@ if step_in_range plot; then
       --tree "results_03/$GENE/03_${GENE}.pensieve_labelled_dated_tree.nwk" \
       --events "results_03/$GENE/03_${GENE}.alignment_events.tsv" \
       --orf-transitions "results_03/$GENE/04_${GENE}.orf_transitions_by_branch.tsv" \
+      --orf-status "results_00/$GENE/00_${GENE}.orf_status.tsv" \
       --alignment-length "$ALN_LEN" \
       --outdir "final_results/$GENE/important_output" --dated "$DATED"
     require_file "final_results/$GENE/important_output/${GENE}.pseudogenization_tree.pdf" plot_pdf

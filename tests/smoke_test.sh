@@ -5,7 +5,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 echo "[1/11] CLI help forms"
 for flag in -h -help --help; do python bin/pensieve "$flag" >/dev/null; done
 python bin/pensieve --help -long > /tmp/pensieve_long_help.$$
-grep -q "Pensieve v4.2 - full manual" /tmp/pensieve_long_help.$$
+grep -q "Pensieve v4.5 - full manual" /tmp/pensieve_long_help.$$
 grep -q "diagnostics < alignment < events < asr < integrate < plot" /tmp/pensieve_long_help.$$
 rm -f /tmp/pensieve_long_help.$$
 

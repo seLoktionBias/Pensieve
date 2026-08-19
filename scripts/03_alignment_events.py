@@ -35,7 +35,7 @@ Design notes (v3.30)
    called frame disruptions.
 
 Standard library only: no Biopython, no network.  This keeps the event engine
-testable in isolation from codeml and IndelMaP.
+testable in isolation from codeml.
 """
 from __future__ import annotations
 
@@ -309,8 +309,17 @@ def clamp_boundary_evidence(pair, cap):
 
 
 def sankoff(nodes_post, tip_states, gain_cost, loss_cost, tie_break,
-            component_entry_idx=None, boundary_cap=None):
+            component_entry_idx=None, boundary_cap=None, pinned=None):
     """Binary Sankoff with explicit tie reporting and a representative history.
+
+    pinned (optional; default None): a {node_idx: state} map of internal nodes
+    whose ancestral state is FIXED as a hard biological constraint before
+    parsimony resolves the rest of the tree. Used by the functional-consensus
+    rule (see functional_consensus_pin()): when two or more phylogenetically
+    independent complete-ORF (functional) lineages share exactly the same indel,
+    that indel must have been present in their common functional ancestor rather
+    than gained convergently in each lineage, so the character's state at that
+    ancestor is pinned PRESENT. A pinned node is never reported as ambiguous.
 
     A representative assignment is needed for plotting/output, but equal-cost
     alternatives remain explicitly ambiguous. No tie-break setting is allowed to
@@ -340,6 +349,7 @@ def sankoff(nodes_post, tip_states, gain_cost, loss_cost, tie_break,
     trans = ((0.0, gain_cost), (loss_cost, 0.0))
     down = {}
     entry_idx = component_entry_idx or set()
+    pins = pinned or {}
     for node in nodes_post:
         if node.is_tip:
             obs = tip_states.get(node.name)
@@ -354,13 +364,20 @@ def sankoff(nodes_post, tip_states, gain_cost, loss_cost, tie_break,
                      if c.idx in entry_idx and boundary_cap is not None else down[c.idx][s])
                     for s in (ABSENT, PRESENT))
                 for c in node.children)
+        # Hard constraint: a pinned internal node's own state is fixed, so the
+        # subtree cost for the other state is made prohibitive (its real cost
+        # given the pinned state is retained for the parent's accounting).
+        if node.idx in pins:
+            costs[1 - pins[node.idx]] = INF
         down[node.idx] = costs
 
     root = nodes_post[-1]
     rc = down[root.idx]
     best = min(rc)
     ambiguous = set()
-    if rc[ABSENT] == rc[PRESENT]:
+    if root.idx in pins:
+        root_state = pins[root.idx]          # fixed constraint, never ambiguous
+    elif rc[ABSENT] == rc[PRESENT]:
         ambiguous.add(root.idx)
         # Representative only. The root remains 'ambiguous' in all biological
         # output fields. 'terminal' prefers the state that avoids an ancestral
@@ -475,6 +492,83 @@ def pseudogenic_components(nodes_post, root, tip_orf_states, orf_loss_cost, orf_
             component_of.setdefault(descendant.idx, entry_node.name)
 
     return orf_assign, orf_ambiguous, component_entry_idx, component_of
+
+
+# ------------------------------------------ functional-consensus ancestral indel
+
+def subtree_tip_sets(nodes_post):
+    """{node.idx: frozenset(tip names under node)} in one postorder pass."""
+    tips_under = {}
+    for node in nodes_post:
+        if node.is_tip:
+            tips_under[node.idx] = frozenset((node.name,))
+        else:
+            acc = set()
+            for child in node.children:
+                acc |= tips_under[child.idx]
+            tips_under[node.idx] = frozenset(acc)
+    return tips_under
+
+
+def mrca_node(carriers, root, tips_under):
+    """Deepest node whose subtree contains every tip in `carriers`."""
+    node = root
+    while True:
+        step = None
+        for child in node.children:
+            if carriers <= tips_under[child.idx]:
+                step = child
+                break
+        if step is None:
+            return node
+        node = step
+
+
+def functional_consensus_pin(states, functional_tips, root, tips_under, node_by_name, min_witnesses):
+    """Return a {node_idx: PRESENT} pin map when an indel must be ancestral
+    because it is shared by >= min_witnesses phylogenetically INDEPENDENT
+    functional (complete-ORF) lineages; otherwise None.
+
+    Rationale (real GUCY2F column-2772 case): complete-ORF lineages are
+    trustworthy witnesses of the functional ancestral sequence. When several
+    independent functional lineages all carry exactly the same indel,
+    convergently gaining it in each is far less plausible than it being present
+    in their common functional ancestor and then lost -- via random
+    post-pseudogenization insertions/substitutions -- in the mostly-pseudogenized
+    lineages that lack it.
+
+    The indel is therefore fixed PRESENT not only at the functional carriers'
+    common ancestor but at EVERY internal node on the paths from that ancestor
+    down to each functional carrier. Pinning the MRCA alone is not enough: with
+    the asymmetric cheap-gain cost the traceback would otherwise re-lose the gap
+    just below the MRCA and re-gain it convergently on each functional branch --
+    exactly the spurious independent deletion this rule exists to prevent. With
+    the whole ancestor path pinned PRESENT, the functional lineages inherit the
+    indel with no event and only the residue-carrier lineages record a loss.
+
+    "Independent" means the functional carriers are not one clean clade: their
+    MRCA subtree also contains a definite non-carrier (a tip scored ABSENT for
+    this character). Two functional carriers that are each other's closest
+    relatives (a lineage-specific shared indel in a single functional subclade)
+    do NOT trigger the rule.
+    """
+    if not min_witnesses or min_witnesses < 2:
+        return None
+    carriers = frozenset(t for t in functional_tips if states.get(t) == PRESENT)
+    if len(carriers) < min_witnesses:
+        return None
+    anc = mrca_node(carriers, root, tips_under)
+    if not any(states.get(t) == ABSENT for t in tips_under[anc.idx]):
+        return None
+    pins = {}
+    for tip_name in carriers:
+        node = node_by_name[tip_name].parent
+        while node is not None:
+            pins[node.idx] = PRESENT
+            if node is anc:
+                break
+            node = node.parent
+    return pins or None
 
 
 # ---------------------------------------------------------------- event merging
@@ -606,6 +700,37 @@ def _merge_event_cluster(cluster):
 
 # ---------------------------------------------------------------- characters
 
+def residue_span(sequence):
+    """1-based (first, last) columns carrying a real ACGT residue, or None."""
+    first = last = None
+    for i, ch in enumerate(sequence, start=1):
+        if ch in ACGT:
+            if first is None:
+                first = i
+            last = i
+    return (first, last) if first is not None else None
+
+
+def event_is_terminal_incompleteness(occ, affected_tips, start, end):
+    """True when an indel sits at the 5' or 3' end of its affected sequences.
+
+    Such an indel reflects that the sequence is TRUNCATED (incomplete) at that
+    end, not that the reading frame of the retained coding sequence is broken.
+    Per the ORF-status rules a frameshift-length indel at the very beginning or
+    end must NOT be treated as pseudogenizing evidence (real GRK7 case:
+    Cynopterus_brachyotis carries only a 349 bp 3'-terminal deletion, no internal
+    frameshift and no premature stop -- it is a partial sequence, not a
+    pseudogene). An indel is terminal when NONE of its affected tips has any
+    coding residue on one side of it (all residues lie to one side).
+    """
+    tips = [t for t in affected_tips if t in occ and occ[t] is not None]
+    if not tips:
+        return False
+    has_5p = any(occ[t][0] <= start - 1 for t in tips)   # a residue strictly 5' of the indel
+    has_3p = any(occ[t][1] >= end + 1 for t in tips)      # a residue strictly 3' of the indel
+    return (not has_5p) or (not has_3p)
+
+
 def gap_runs(sequence, gap="-"):
     """Maximal runs of gap in one sequence, as 1-based inclusive intervals."""
     runs, start = [], None
@@ -637,6 +762,25 @@ def decompose_run(run, all_intervals, tolerance, _depth=0):
     A contained run that shares NEITHER breakpoint is a separate, interior event
     (Nycteris thebaica 661-669 inside the Miniopterus deletion) and must not
     split anything.
+
+    The shared core is decomposed RECURSIVELY, exactly like the residual, so a
+    run is broken into the same atomic segments no matter which larger run it
+    came from. Without this, decomposition is inconsistent: on real GRK7 data
+    column 61 is an all-gap column, so most species carry a 61-66 gap while
+    Molossus_molossus carries a longer 61-71 gap. (61,66) decomposes to
+    (61,61)+(62,66) [it strictly contains ferrumequinum's 1 bp (61,61) run and
+    shares that run's left breakpoint], but (61,71) used to pick its single
+    largest one-breakpoint sub-run (61,66) as an undecomposed core, yielding
+    (61,66)+(67,71). Molossus's (61,66) core then matched no other species'
+    (61,66) segment -- because every other species had already been split into
+    (61,61)+(62,66) -- so it clustered alone as a spurious singleton 61-66 indel
+    character and was reported as a Molossus-only event, even though 61-66 is
+    all-gap for Molossus and only 62-66 (ferrumequinum's insertion) carries any
+    real residue. Recursively decomposing the core makes (61,71) resolve to
+    (61,61)+(62,66)+(67,71), so Molossus joins the shared (62,66) character and
+    only its genuine (67,71) extension is its own event. Interior runs that share
+    neither breakpoint (Nycteris 661-669) still never split the core, so the
+    documented Miniopterus/Nycteris behaviour is unchanged.
     """
     start, end = run
     if _depth > 64:
@@ -656,7 +800,7 @@ def decompose_run(run, all_intervals, tolerance, _depth=0):
     if best is None:
         return [(start, end)]
     cs, ce = best
-    out = [(cs, ce)]
+    out = decompose_run((cs, ce), all_intervals, tolerance, _depth + 1)  # core, recursively
     if abs(cs - start) <= tolerance:                   # shared left -> residual right
         if ce + 1 <= end:
             out += decompose_run((ce + 1, end), all_intervals, tolerance, _depth + 1)
@@ -847,7 +991,7 @@ EVENT_HEADER = [
     "root_state", "parsimony_score", "delta_parsimony_support", "ambiguous_origin", "direction_confident",
     "parent_age", "child_age", "age_interval",
     "n_observed_present", "n_observed_absent", "n_unknown",
-    "observed_present_tips", "breakpoint_relationships", "coordinate_system",
+    "observed_present_tips", "terminal_incompleteness", "breakpoint_relationships", "coordinate_system",
 ]
 
 CHAR_HEADER = [
@@ -855,7 +999,7 @@ CHAR_HEADER = [
     "character_length", "length_mod_3", "n_member_runs", "member_breakpoints",
     "n_observed_present", "n_observed_absent", "n_unknown", "root_state",
     "parsimony_score", "n_gains", "n_losses", "ambiguous_nodes", "history_ambiguous", "stop_codon",
-    "breakpoint_relationships",
+    "functional_ancestral_indel", "breakpoint_relationships",
 ]
 
 STATE_HEADER = ["gene", "character_id", "character_class", "node_label", "node_type", "state",
@@ -929,6 +1073,17 @@ def main():
                              "pseudogenic component may contribute to its own parent's structural-character "
                              "cost, regardless of how many real descendant tips it contains -- the cap "
                              "itself is this value times max(gain_cost, loss_cost) for that character.")
+    parser.add_argument("--min-functional-witnesses", type=int, default=2,
+                        help="Functional-consensus ancestral-indel rule (requires --orf-status). If this "
+                             "many or more phylogenetically INDEPENDENT complete-ORF (functional) lineages "
+                             "carry exactly the same indel, that indel is fixed as PRESENT at their common "
+                             "functional ancestor instead of being reconstructed as an independent gain on "
+                             "each lineage -- convergent gain of the identical indel in several independent "
+                             "functional lineages is biologically implausible; the parsimonious, biological "
+                             "reading is an ancestral indel preserved in the functional lineages and lost "
+                             "(via random post-pseudogenization mutations) in the pseudogenized ones (real "
+                             "GUCY2F/column-2772 case). Set to 0 to disable; the minimum meaningful value "
+                             "is 2.")
     args = parser.parse_args()
 
     if args.gain_cost <= 0 or args.loss_cost <= 0:
@@ -963,9 +1118,12 @@ def main():
     # Computed once, before any structural character is reconstructed, and
     # reused for every character below -- never the other way around.
     component_entry_idx, component_of, orf_assign, orf_ambiguous = set(), {}, {}, set()
+    functional_tips = frozenset()
     if args.orf_status:
         orf_status_rows = read_tsv(args.orf_status)
         tip_orf_states = read_tip_orf_states(orf_status_rows, tips)
+        # complete-ORF (functional) tips: ABSENT in tip_orf_states means complete_orf.
+        functional_tips = frozenset(t for t in tips if tip_orf_states.get(t) == ABSENT)
         orf_assign, orf_ambiguous, component_entry_idx, component_of = pseudogenic_components(
             nodes_post, root, tip_orf_states, args.orf_loss_cost, args.orf_restoration_cost, args.tie_break)
         print(f"[info] ORF-aware boundary evidence: {len(component_entry_idx)} pseudogenic component(s) "
@@ -1058,6 +1216,13 @@ def main():
           f"{sum(1 for c in characters if c['klass'] == 'stop_mask')} stop-mask")
 
     # ---- reconstruct
+    # Functional-consensus ancestral-indel rule (see functional_consensus_pin):
+    # enabled only when tip ORF status is available and the witness threshold is
+    # at least 2. tips_under is the subtree-tip map used to place an ancestral pin.
+    use_functional_pin = bool(functional_tips) and args.min_functional_witnesses >= 2
+    tips_under = subtree_tip_sets(nodes_post) if use_functional_pin else {}
+    node_by_name = {n.name: n for n in nodes_post} if use_functional_pin else {}
+    functional_ancestral_ids = []
     event_rows, char_rows, state_rows = [], [], []
     present_at = defaultdict(set)          # node -> set of character ids
     event_counter = 0
@@ -1086,9 +1251,17 @@ def main():
         # character's own gain/loss costs to scale the cap.
         boundary_cap = (args.pseudogenic_boundary_cap_votes * max(gain_cost, loss_cost)
                         if component_entry_idx else None)
+        # If two or more independent functional lineages share this indel, fix it
+        # PRESENT at their common functional ancestor rather than let parsimony
+        # reconstruct an implausible convergent gain on each functional branch.
+        pinned = (functional_consensus_pin(states, functional_tips, root, tips_under,
+                                           node_by_name, args.min_functional_witnesses)
+                  if use_functional_pin and character["klass"] == "indel" else None)
+        if pinned is not None:
+            functional_ancestral_ids.append(character["id"])
         assign, score, ambiguous, delta = sankoff(
             nodes_post, states, gain_cost, loss_cost, args.tie_break,
-            component_entry_idx=component_entry_idx, boundary_cap=boundary_cap)
+            component_entry_idx=component_entry_idx, boundary_cap=boundary_cap, pinned=pinned)
         root_state = assign[root.idx]
 
         for node in nodes_post:
@@ -1207,10 +1380,26 @@ def main():
                 n.name for n in nodes_post if n.idx in ambiguous)) or "NA",
             "history_ambiguous": bool(ambiguous),
             "stop_codon": character.get("stop_codon", "NA"),
+            "functional_ancestral_indel": pinned is not None,
             "breakpoint_relationships": character["relationships"],
         })
 
     event_rows = merge_contiguous_same_type_indel_events(event_rows)
+
+    # Flag every event that is a 5'/3'-terminal indel (computed on the final,
+    # post-merge span). A frameshift-length terminal indel means the sequence is
+    # truncated there, not pseudogenized, so downstream ORF-status logic and the
+    # figures exclude it from disabling evidence. stop_mask events never count.
+    occ = {tip: residue_span(alignment[tip]) for tip in tips}
+    for row in event_rows:
+        if row.get("character_class") != "indel":
+            row["terminal_incompleteness"] = False
+            continue
+        start = safe_int(row.get("alignment_start")); end = safe_int(row.get("alignment_end"))
+        affected = [t for t in str(row.get("affected_tips", "")).split(",") if t and t != "NA"]
+        row["terminal_incompleteness"] = bool(
+            start is not None and end is not None
+            and event_is_terminal_incompleteness(occ, affected, start, end))
 
     # ---- signed frame arithmetic: no ancestral nucleotide ASR required
     char_by_id = {c["id"]: c for c in characters}
@@ -1283,6 +1472,10 @@ def main():
     ties = [r for r in event_rows if trueish(r["ambiguous_origin"])]
     print(f"[result] {len(event_rows)} events on {len({r['branch'] for r in event_rows})} branches; "
           f"{len(shared)} shared; {len(ties)} with an exact parsimony tie")
+    if use_functional_pin:
+        print(f"[info] functional-consensus rule (min {args.min_functional_witnesses} independent "
+              f"complete-ORF witnesses): {len(functional_ancestral_ids)} indel character(s) fixed as "
+              f"ancestral: {', '.join(functional_ancestral_ids) if functional_ancestral_ids else 'none'}")
     for row in sorted(shared, key=lambda r: (-int(r["event_length"]), int(r["alignment_start"])))[:15]:
         print(f"   {row['biological_interpretation']:<24} {row['alignment_start']}-{row['alignment_end']} "
               f"({row['event_length']} bp)  {row['branch']}  affects {row['n_affected_tips']}")

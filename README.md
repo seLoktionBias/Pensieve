@@ -4,7 +4,15 @@
 
 Pensieve is a gene-centred workflow for reconstructing **where coding-sequence lesions arose on a rooted species tree**. It combines a frameshift-aware MACSE alignment, PAML `codeml` ancestral nucleotide reconstruction, and its own parsimony-based event/history engine to answer, for any coding gene and any rooted tree of species: *which lineage lost this gene first, is the loss shared or independent, and what exactly broke it (a premature stop, a frameshifting indel, or something ambiguous)?* The result is a fully reconstructed ancestral sequence at every internal node and two publication-ready figures per gene.
 
-v3.31 made installation/execution portable across local machines and HPC systems (no assumption of Miniforge, mamba, or any site-specific module command); every release since has kept that portability while fixing real bugs found by running Pensieve on real genomes, listed in full in [`CHANGELOG.md`](CHANGELOG.md). The current release is v4.2 (see `VERSION`).
+v3.31 made installation/execution portable across local machines and HPC systems (no assumption of Miniforge, mamba, or any site-specific module command); every release since has kept that portability while fixing real bugs found by running Pensieve on real genomes, listed in full in [`CHANGELOG.md`](CHANGELOG.md). The current release is **v4.5** (see `VERSION`).
+
+**Recent highlights (v4.3–v4.5):**
+
+- **Three-way ORF status.** Every tip and every reconstructed ancestor is classified as **intact** (complete ORF), **pseudogenized/disrupted** (an in-frame premature stop or an *internal* frameshift indel), or **partial** (incomplete — missing ATG and/or length not a multiple of three and/or truncated — but with no premature stop and no internal frameshift). Incompleteness alone is never treated as evidence of pseudogenization; partial branches are drawn orange.
+- **Functional-consensus ancestral indels** (`--min-functional-witnesses`, default 2). When two or more phylogenetically independent complete-ORF lineages share exactly the same indel, it is fixed as ancestral rather than reconstructed as an implausible convergent gain on each lineage (the biological reading is an ancestral indel preserved in the functional lineages and lost in the mostly-pseudogenized ones).
+- **`--alignment defined` runs with no MACSE**, reading premature stops directly off the supplied codon frame; `scripts/prepare_defined_alignment.py` is an opt-in helper to make an off-frame curated alignment ready (assembly-gap masking + trailing all-gap trim).
+- **Clearer figures.** A red **×** marks any tip whose CDS lacks an ATG start codon; frameshift insertions and deletions are coloured separately; terminal (5′/3′) indels are drawn as non-disabling; and figure legends are now **fixed and complete**, so they are identical and directly comparable across genes and between `--alignment perform` and `--alignment defined`.
+- **IndelMaP has been removed** entirely; the core PAML+Pensieve inference is unchanged.
 
 ---
 
@@ -34,7 +42,7 @@ cd Pensieve
 bash install.sh
 ```
 
-`install.sh` auto-detects mamba, falls back to conda, and falls back further to a staged, lower-memory install if the environment solve gets OOM-killed. It also clones and wires up IndelMaP (optional concordance checking) and PAML/`codeml` automatically. See [Full installation reference](#installation) for venv-only, current-environment, and other backends.
+`install.sh` auto-detects mamba, falls back to conda, and falls back further to a staged, lower-memory install if the environment solve gets OOM-killed. It also wires up PAML/`codeml` automatically. See [Full installation reference](#installation) for venv-only, current-environment, and other backends.
 
 **HPC cluster, interactive session**
 
@@ -102,7 +110,6 @@ Pensieve v3.31 assigns one job to each layer:
 - **MACSE**: frameshift-aware coding-sequence alignment/diagnosis.
 - **Pensieve breakpoint engine**: homologous indel-character definition and transparent tree-based event reconstruction.
 - **codeml**: marginal ancestral nucleotide/codon reconstruction on a fixed topology.
-- **IndelMaP (optional)**: independent indel-aware concordance check; it never overwrites Pensieve's authoritative gap states.
 - **Pensieve ORF walk**: combines PAML nucleotide scaffolds with Pensieve lesion states, reconstructs native ancestral CDSs, and distinguishes first loss, inherited loss history and apparent compensatory restoration.
 
 The authoritative order is:
@@ -132,8 +139,6 @@ native structural view          PAML-safe view
                  |
                  v
 05 figures
-
-Optional IndelMaP -----------------> concordance table only
 ```
 
 See `INFERENCE_SPEC.md` for the detailed scientific rules.
@@ -348,6 +353,14 @@ biological_interpretation = ambiguous_indel_change / ambiguous_stop_change
 
 This prevents the v3.25 failure in which a root tie could be rendered as a definitive deletion.
 
+### Functional-consensus ancestral indels
+
+```bash
+--min-functional-witnesses 2   # default; 0 disables
+```
+
+Complete-ORF (functional) lineages are trustworthy witnesses of the functional ancestral sequence. When this many or more **phylogenetically independent** functional lineages carry exactly the same indel, Pensieve fixes that indel as **present at their common functional ancestor** before parsimony resolves the rest of the tree, rather than reconstructing an independent gain on each functional branch. Convergent gain of the identical indel in several independent functional lineages is biologically implausible; the parsimonious reading is an ancestral indel preserved in the functional lineages and lost — via random post-pseudogenization mutations — in the mostly-pseudogenized lineages that lack it (real GUCY2F/column-2772 case, where four independent functional lineages carrying a 1 bp deletion were otherwise reconstructed as four independent deletions "resurrecting" the gene). Characters fixed this way are flagged `functional_ancestral_indel` in `03_<GENE>.alignment_characters.tsv`.
+
 ## Signed frame arithmetic
 
 Frame state is tracked separately from premature STOPs.
@@ -380,23 +393,6 @@ Thus codeml estimates its own branch lengths under its codon model. IQ-TREE bran
 
 With `clock = 0`, the biological dated root does not have a distinct PAML marginal sequence. Pensieve therefore does **not fabricate a root sequence**. The root can have reconstructed structural states, but its full sequence-based ORF status is reported as unavailable.
 
-## IndelMaP
-
-```bash
---indelmap auto   # default; attempt when available, warn/continue if unavailable/fails
---indelmap yes    # explicitly request an attempt
---indelmap no     # skip it
-```
-
-IndelMaP is an independent evidence layer. Its ancestral gaps are never projected onto the authoritative PAML scaffold.
-
-The comparison is written to:
-
-```text
-03_GENE.indelmap_concordance.tsv
-```
-
-A PDE6H-specific IndelMaP failure therefore does not destroy the core Pensieve reconstruction.
 
 ## Ancestral sequence integration
 
@@ -483,7 +479,7 @@ Descendants of the same pseudogenization event share one evolutionary history af
 
 ### A raw premature stop must survive its own frame correction to count
 
-A single early frameshift can make a raw, unaligned sequence read many downstream premature stop codons in the shifted frame — those stops are consequences of the one frameshift, not independent nonsense mutations, and disappear as soon as that frameshift is corrected. Before a raw premature stop can found a phylogenetic character, Pensieve requires three things to hold simultaneously: the cumulative upstream MACSE frame correction is zero at that exact position (the frame is not shifted there), its three raw nucleotides map to three consecutive columns of the final canonical alignment (no placeholder wedged inside the codon), and the actual homologous codon read back from that final alignment is still exactly TAA/TAG/TGA. A stop that fails any of these is kept in the diagnostic registry (`02_<GENE>.masked_inframe_premature_stops_after_macse_correction.tsv`, `reason` column) but never enters parsimony or the event plot, and a tip whose own occurrence fails validation is never counted as carrying some other, independently-validated tip's stop character merely because its alignment segment spells the same codon.
+A single early frameshift can make a raw, unaligned sequence read many downstream premature stop codons in the shifted frame — those stops are consequences of the one frameshift, not independent nonsense mutations, and disappear as soon as that frameshift is corrected. Before a raw premature stop can found a phylogenetic character, Pensieve requires four things to hold simultaneously: the cumulative upstream MACSE frame correction is zero at that exact position (the frame is not shifted there), its three raw nucleotides map to three consecutive columns of the final canonical alignment (no placeholder wedged inside the codon), that mapped span actually starts on a real codon boundary of the alignment's own shared codon frame (not just any three consecutive columns — a raw-frame stop position can land on a column that only *looks* like a codon start once an earlier correction has shifted the column numbering, even when the frame-correction check above already passed), and the actual homologous codon read back from that final alignment is still exactly TAA/TAG/TGA. A stop that fails any of these is kept in the diagnostic registry (`02_<GENE>.masked_inframe_premature_stops_after_macse_correction.tsv`, `reason` column) but never enters parsimony or the event plot, and a tip whose own occurrence fails validation is never counted as carrying some other, independently-validated tip's stop character merely because its alignment segment spells the same codon.
 
 
 ## Safe handling of codeml joint-reconstruction failures
@@ -571,7 +567,6 @@ GENE.ancestral_integrated_alignment.fa         # same phylogenetic row order
 GENE.ancestral_native_cds.fa                   # same phylogenetic row order
 GENE.pensieve_tree.nwk
 GENE.internode_label_crosswalk.tsv
-GENE.indelmap_concordance.tsv
 GENE.pseudogenization_tree.pdf/.png
 GENE.event_map.pdf/.png
 ```

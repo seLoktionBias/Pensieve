@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Integrate PAML substitution ASR with Pensieve event states and reconstruct ORF history.
 
-IndelMaP is deliberately absent from this authoritative integration.  The PAML
+The PAML
 marginal sequence is the nucleotide scaffold for each non-root internode; the
 Pensieve event engine decides structural gap/STOP states.  The dated biological
 root has no distinct PAML marginal sequence under clock=0 and is therefore never
@@ -160,7 +160,55 @@ def node_depth(node):
     return depth
 
 
+def has_internal_frameshift(aligned_sequence):
+    """True when a gap run STRICTLY inside the sequence's own occupied span has a
+    length that is not a multiple of three.
+
+    The canonical alignment is a codon frame (columns come in triplets), so an
+    internal gap run whose length is a multiple of three removes whole codons and
+    preserves the reading frame, while a non-multiple-of-three internal gap run
+    shifts it. Leading and trailing gaps are 5'/3' truncation (incompleteness),
+    never a frameshift. A lineage-specific insertion appears as its own padding
+    gaps inside the span, so this also detects internal insertions. This is what
+    distinguishes a partial (truncated but in-frame) sequence from a genuinely
+    pseudogenized one.
+    """
+    residues = [i for i, ch in enumerate(aligned_sequence) if ch != "-"]
+    if not residues:
+        return False
+    first, last = residues[0], residues[-1]
+    j = first
+    while j <= last:
+        if aligned_sequence[j] == "-":
+            run_start = j
+            while j <= last and aligned_sequence[j] == "-":
+                j += 1
+            if (j - run_start) % 3 != 0:
+                return True
+        else:
+            j += 1
+    return False
+
+
 def orf_check(aligned_sequence, structural_uncertain=False):
+    """Classify a reconstructed/observed aligned CDS as intact / partial /
+    disrupted / uncertain.
+
+    complete (-> intact)     : starts with ATG, length a multiple of three, and
+                               no in-frame premature stop. Terminal stop optional.
+    pseudogenized (-> disrupted): an in-frame premature stop OR an INTERNAL
+                               frameshift indel (non-terminal). ATG/length/terminal
+                               stop are all optional here -- they can be lost.
+    partial                  : incomplete (missing ATG, length not a multiple of
+                               three, and/or truncated) but with NO in-frame
+                               premature stop and NO internal frameshift, i.e. no
+                               positive evidence of pseudogenization. Absence of a
+                               complete ORF is not evidence of pseudogenization --
+                               the sequence may simply be a partial/truncated CDS.
+    A directly complete sequence is always intact even if catalogued indels exist
+    (they compensate / are alignment artifacts) -- the reconstructed sequence is
+    ground truth, matching the pre-existing PDE6C behaviour.
+    """
     seq = aligned_sequence.replace("-", "")
     codons = [seq[i:i + 3] for i in range(0, len(seq) - len(seq) % 3, 3)]
     starts = len(seq) >= 3 and seq[:3] == "ATG"
@@ -170,19 +218,24 @@ def orf_check(aligned_sequence, structural_uncertain=False):
     scan = codons[:-1] if has_terminal_stop else codons
     internal_stops = [(i + 1, c) for i, c in enumerate(scan) if c in STOPS]
     n_unknown_bases = sum(ch not in ACGT for ch in seq)
-    definite_disruption = (not starts) or (not mod3) or bool(internal_stops)
+    internal_frameshift = has_internal_frameshift(aligned_sequence)
+    complete = starts and mod3 and not internal_stops
+    pseudogenizing = bool(internal_stops) or internal_frameshift
     sequence_uncertain = n_unknown_bases > 0
-    if definite_disruption:
+    if complete:
+        status = "uncertain" if (structural_uncertain or sequence_uncertain) else "intact"
+    elif pseudogenizing:
         status = "disrupted"
     elif structural_uncertain or sequence_uncertain:
         status = "uncertain"
     else:
-        status = "intact"
+        status = "partial"
     return {
         "cds_length": len(seq), "length_mod_3": len(seq) % 3,
         "starts_with_atg": starts, "has_terminal_stop": has_terminal_stop,
         "n_internal_stops": len(internal_stops),
         "internal_stop_codons": ",".join(f"{i}:{c}" for i, c in internal_stops) or "NA",
+        "has_internal_frameshift": internal_frameshift,
         "n_unknown_bases": n_unknown_bases,
         "structural_state_uncertain": structural_uncertain,
         "sequence_uncertain": sequence_uncertain,
@@ -260,6 +313,7 @@ def main():
                     "sequence_source": "no_distinct_paml_clock0_root_sequence" if node.parent is None else "missing_paml_sequence",
                     "cds_length": "NA", "length_mod_3": "NA", "starts_with_atg": "NA",
                     "has_terminal_stop": "NA", "n_internal_stops": "NA", "internal_stop_codons": "NA",
+                    "has_internal_frameshift": "NA",
                     "n_unknown_bases": "NA", "structural_state_uncertain": True,
                     "sequence_uncertain": True, "coding_status": "unavailable", "coding_intact": "NA",
                 })
@@ -436,10 +490,18 @@ def main():
         acquired = events_by_branch.get(branch, [])
         confident_disabling = []
         ambiguous_disabling = []
+        terminal_incomplete = []
         for ev in acquired:
             is_stop_gain = ev.get("character_class") == "stop_mask" and ev.get("biological_interpretation") == "premature_stop_gained"
             is_frameshift = ev.get("character_class") == "indel" and safe_int(ev.get("length_mod_3")) not in {None, 0}
             if not (is_stop_gain or is_frameshift):
+                continue
+            # A frameshift-length indel at the very 5'/3' end of the sequence is
+            # truncation (incompleteness), not a disabling lesion, so it never
+            # founds a pseudogenization call. Premature stops are always internal
+            # by construction and are never excluded here.
+            if is_frameshift and trueish(ev.get("terminal_incompleteness")):
+                terminal_incomplete.append(ev.get("event_id", "NA"))
                 continue
             if trueish(ev.get("direction_confident")):
                 confident_disabling.append(ev.get("event_id", "NA"))
@@ -509,6 +571,13 @@ def main():
                 transition = "intact"
                 transition_evidence = ("no_inferred_disabling_history" if not confident_disabling
                                        else "catalogued_disabling_events_but_child_orf_intact")
+            elif child_status == "partial":
+                # Incomplete sequence with no internal frameshift and no premature
+                # stop: no positive evidence of pseudogenization. Not pseudogenic.
+                child_hist = False
+                transition = "partial"
+                transition_evidence = ("incomplete_sequence_no_pseudogenization_evidence"
+                                       + ("_terminal_indel_only" if terminal_incomplete else ""))
             elif confident_disabling:
                 child_hist = True
                 transition = "confirmed_disabling_event_first_loss_unresolved"
@@ -543,6 +612,16 @@ def main():
             transition = "intact"
             transition_evidence = ("no_inferred_disabling_history" if not confident_disabling
                                    else "catalogued_disabling_events_but_child_orf_intact")
+
+        elif child_status == "partial":
+            # Incomplete but no internal frameshift and no premature stop: the
+            # sequence may simply be truncated. No pseudogenization evidence, so
+            # this is highlighted as partial (not a disabling event) and does not
+            # start a pseudogenic history for its descendants.
+            child_hist = False
+            transition = "partial"
+            transition_evidence = ("incomplete_sequence_no_pseudogenization_evidence"
+                                   + ("_terminal_indel_only" if terminal_incomplete else ""))
 
         elif confident_disabling:
             child_hist = True
@@ -604,6 +683,7 @@ def main():
             "known_pseudogenic_history": "unknown" if child_hist is None else child_hist,
             "confident_disabling_events_on_branch": ",".join(confident_disabling) or "NA",
             "ambiguous_disabling_events_on_branch": ",".join(ambiguous_disabling) or "NA",
+            "terminal_incompleteness_events_on_branch": ",".join(terminal_incomplete) or "NA",
             "all_events_on_branch": ",".join(ev.get("event_id", "NA") for ev in acquired) or "NA",
             "n_events_on_branch": len(acquired),
         })
@@ -635,6 +715,7 @@ def main():
 
     print(f"Finished ORF/history integration for {gene}; nodes_with_sequence={len(integrated)}; "
           f"pseudogenization_branches={sum(r['orf_transition']=='pseudogenization' for r in branch_rows)}; "
+          f"partial_branches={sum(r['orf_transition']=='partial' for r in branch_rows)}; "
           f"apparent_restorations={sum(r['orf_transition']=='apparent_orf_restoration' for r in branch_rows)}")
 
 

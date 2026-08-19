@@ -30,10 +30,24 @@ def gapless_seq(seq):
     return clean_seq(seq).replace("-", "")
 
 
-def strip_terminal_stop(seq):
+def strip_terminal_stop(seq, preserve_width=False):
     """Remove a single trailing TAA/TAG/TGA -- whatever this sequence's own
     real (gap-stripped) last 3 characters are, if they spell a stop codon --
     before anything else in the pipeline ever sees it.
+
+    preserve_width (used for --alignment defined): the input is one row of a
+    user-curated codon alignment whose column count is authoritative and must
+    stay identical across every row. Deleting the 3 terminal characters there
+    would shorten only the rows that happen to carry a terminal stop -- and,
+    because a defined row's real terminal codon is frequently followed by
+    trailing alignment gaps, would delete characters from the MIDDLE of the row
+    rather than its end -- desynchronising the alignment and making step 02's
+    equal-length check fail (confirmed on real PDE6C/CNGB3/GUCY2F data, where
+    only some species carry a terminal stop). With preserve_width the terminal
+    stop's three real characters are replaced by gaps in place instead, so the
+    stop is genuinely removed from every downstream (gap-stripped) view while
+    the alignment keeps exactly the same columns Pensieve promised never to
+    add or remove for a defined alignment.
 
     v4.0: Pensieve no longer reconstructs a terminal stop codon at ancestral
     nodes at all (see CHANGELOG) -- PAML's codon model structurally cannot
@@ -63,6 +77,8 @@ def strip_terminal_stop(seq):
         return seq
     non_gap_idx = [i for i, c in enumerate(seq) if c != "-"]
     remove = set(non_gap_idx[-3:])
+    if preserve_width:
+        return "".join("-" if i in remove else c for i, c in enumerate(seq))
     return "".join(c for i, c in enumerate(seq) if i not in remove)
 
 
@@ -111,14 +127,18 @@ def main():
     ap.add_argument("--fasta", required=True)
     ap.add_argument("--tree", required=True)
     ap.add_argument("--outdir", required=True)
+    ap.add_argument("--alignment-mode", choices=["perform", "defined"], default="perform",
+                    help="defined: the FASTA is an authoritative codon alignment; the terminal "
+                         "stop is removed by gapping in place so every column is preserved.")
     args = ap.parse_args()
 
     gene = args.gene
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
+    preserve_width = args.alignment_mode == "defined"
     recs = {r.id.split()[0]: clean_seq(str(r.seq)) for r in SeqIO.parse(args.fasta, "fasta")}
-    recs = {name: strip_terminal_stop(seq) for name, seq in recs.items()}
+    recs = {name: strip_terminal_stop(seq, preserve_width=preserve_width) for name, seq in recs.items()}
     tree = Phylo.read(args.tree, "newick")
     tree_tips = {t.name for t in tree.get_terminals()}
     fasta_names = set(recs)

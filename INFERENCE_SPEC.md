@@ -8,9 +8,8 @@ This file defines the scientific contract implemented by the code. If code and d
 2. The **canonical alignment** is the sole coordinate authority. Pensieve never selects or uses a reference species/sequence for event discovery, coordinates, polarity, diagnostics, ASR, or plotting.
 3. Pensieve's **breakpoint/STOP character reconstruction** is the authoritative structural-event history.
 4. **PAML** is the nucleotide-substitution ASR scaffold, not an indel-history estimator.
-5. **IndelMaP** is independent concordance evidence and must never silently overwrite authoritative structural states.
-6. A codeml process exit code does not by itself define ASR success. The `rst` line `Nodes X to Y are ancestral` is the sole source of truth for how many PAML ancestral sequences that run declares: `Y-X+1`. Pensieve validates only section `(1) Marginal reconstruction of ancestral sequences`, requiring every declared `node #X ... node #Y` exactly once at the expected alignment length. A later joint-reconstruction failure is non-fatal when this marginal section is complete. Pensieve never guesses ASR completeness from tip count or `n-2`.
-7. `Node<i>` labels belong to Pensieve. PAML/IndelMaP labels are crosswalk metadata.
+5. A codeml process exit code does not by itself define ASR success. The `rst` line `Nodes X to Y are ancestral` is the sole source of truth for how many PAML ancestral sequences that run declares: `Y-X+1`. Pensieve validates only section `(1) Marginal reconstruction of ancestral sequences`, requiring every declared `node #X ... node #Y` exactly once at the expected alignment length. A later joint-reconstruction failure is non-fatal when this marginal section is complete. Pensieve never guesses ASR completeness from tip count or `n-2`.
+6. `Node<i>` labels belong to Pensieve. PAML labels are crosswalk metadata.
 
 ## 2. Canonical alignment
 
@@ -159,13 +158,7 @@ A compensatory indel is therefore never interpreted as proof of biological resur
 
 A frameshifting GAP state reconstructed at the sampled root does **not** by itself prove a pre-root deletion: it may instead represent ancestral absence before a residue insertion. Pre-root indel-based pseudogenic history is therefore not asserted from root gap occupancy alone.
 
-## 12. IndelMaP
-
-IndelMaP may agree or disagree. Both are informative.
-
-Its role is to write concordance evidence. A missing/crashed IndelMaP run must not prevent the core PAML+Pensieve reconstruction from completing.
-
-## 13. Plotting
+## 12. Plotting
 
 - strong red: first confident disabling branch;
 - pale red: inherited pseudogenic history;

@@ -165,7 +165,9 @@ def print_short_help():
       --mode local|slurm       run locally or submit the whole workflow to Slurm
       --env-mode MODE          inherit|conda|mamba|venv (default inherit)
       --env-name NAME          conda/mamba env name (default Pensieve)
-      --indelmap auto|yes|no   independent indel concordance layer (default auto)
+      --min-functional-witnesses N
+                               >=N independent complete-ORF lineages sharing an indel
+                               fix it as ancestral (default 2; 0 disables)
       --tie-break none|ancestral|terminal
       --run_from_step STEP     diagnostics|alignment|events|asr|integrate|plot
       --run_up_to STEP         diagnostics|alignment|events|asr|integrate|plot
@@ -181,7 +183,7 @@ def print_short_help():
 def print_long_help():
     print(textwrap.dedent("""\
     ===========================================================================
-    Pensieve v4.2 - full manual
+    Pensieve v4.5 - full manual
     ===========================================================================
 
     PURPOSE
@@ -214,11 +216,16 @@ def print_long_help():
       diagnostics
         00  Reconcile taxa and audit each raw CDS. Missing a terminal stop codon
             is NOT a reason to call an ORF incomplete. Internal in-frame stops,
-            start state, length modulo 3 and ambiguity are retained.
+            start state (presence/absence of an ATG start codon), length modulo 3
+            and ambiguity are retained per species in 00_<gene>.orf_status.tsv.
+            Under --alignment defined the terminal stop is removed by gapping in
+            place, preserving every column of the supplied alignment.
         01  Run MACSE across the homologous sequence set for frameshift-aware
             diagnosis/alignment. MACSE '!' is treated as a partial-codon
             placeholder, not intrinsically as a 1-bp deletion. MACSE is the
-            single alignment engine Pensieve uses anywhere in the pipeline.
+            single alignment engine Pensieve uses anywhere in the pipeline, and
+            it runs ONLY under --alignment perform: --alignment defined skips
+            MACSE entirely and uses the supplied codon alignment directly.
 
             Conserved start-block quality check: MACSE can place a frame-
             correction marker anywhere its own global alignment finds
@@ -245,7 +252,19 @@ def print_long_help():
             --alignment defined:
                 the supplied codon alignment is authoritative; Pensieve never
                 inserts/deletes/rebuilds columns. FASTA records are reordered
-                only to follow the rooted tree for manual inspection.
+                only to follow the rooted tree for manual inspection. No MACSE
+                is run: premature stops are read directly off the alignment's
+                own codon frame (each codon is a consecutive column triplet, as
+                `fold -w 3` would give but only ever on real codon boundaries),
+                the terminal stop is excluded, and every in-frame TAA/TAG/TGA is
+                recorded at its exact alignment columns and masked to NNN for the
+                codeml-safe view. The alignment length must be a multiple of 3;
+                a curated alignment that arrives off codon frame (e.g. with
+                trailing all-gap padding, and/or a per-species assembly-gap
+                mask file) can be made ready first with the opt-in helper
+                scripts/prepare_defined_alignment.py (mask assembly gaps to N,
+                trim leading/trailing all-gap padding), which never edits real
+                residues or internal columns.
 
             Two synchronized views of those same columns are written:
               02_<gene>.primary_codon_alignment_native.fasta
@@ -317,12 +336,6 @@ def print_long_help():
             uses. Set PENSIEVE_ASR_POLL_SECONDS to change the poll interval
             (default 10s).
 
-            IndelMaP is optional/independent. It never supplies the authoritative
-            ancestral gap state. --indelmap auto attempts it when available and
-            records failure without aborting the core Pensieve inference;
-            --indelmap yes requires an attempt but still preserves the core
-            result if IndelMaP itself fails; --indelmap no skips it.
-
       integrate
         04  Parse codeml marginal ancestral sequences, map PAML node numbers to
             Pensieve-owned Node<i> labels by topology, and overlay Pensieve's
@@ -342,13 +355,26 @@ def print_long_help():
             inferred, descendants remain descendants of that loss even if a
             compensatory change later restores frame or an apparent ORF.
 
-            IndelMaP, when available, is compared in a concordance table only.
-
       plot
         05  Plot branch-resolved history. First disabling branch = strong red;
             inherited pseudogenic history = pale red; uncertain origin = amber;
-            apparent frame/ORF restoration is annotated without turning the
-            lineage back into a functional grey branch.
+            incomplete-but-not-pseudogenized (partial) = orange; apparent
+            frame/ORF restoration is annotated without turning the lineage back
+            into a functional grey branch. Any species whose CDS lacks an ATG
+            start codon (starts_with_atg = False in step 00) is marked with a
+            small red X at its tip on both figures. Frameshift insertions and
+            frameshift deletions are drawn in separate marker colours; a
+            terminal (5'/3') frameshift indel is drawn as a muted terminal-
+            incompleteness marker, not a disabling one; shared, non-disrupting
+            in-frame indels keep their own.
+
+            ORF status is three-way and identical for tips and reconstructed
+            ancestors: intact (complete ORF), disrupted/pseudogenized (an
+            in-frame premature stop or an INTERNAL frameshift indel), or partial
+            (incomplete -- missing ATG and/or length not a multiple of three
+            and/or truncated -- but with no premature stop and no internal
+            frameshift). Incompleteness alone is never treated as evidence of
+            pseudogenization.
 
     ---------------------------------------------------------------------------
     STEP HIERARCHY / RESUME
@@ -390,9 +416,17 @@ def print_long_help():
           default 0. Keep 0 unless manual inspection demonstrates a small
           alignment offset that should be clustered.
 
-      --indelmap auto|yes|no
-          default auto. Independent concordance only; never authoritative gap
-          projection.
+      --min-functional-witnesses N
+          default 2. When N or more phylogenetically INDEPENDENT complete-ORF
+          (functional) lineages carry exactly the same indel, that indel is
+          fixed as PRESENT at their common functional ancestor rather than
+          reconstructed as an independent gain on each lineage: convergent gain
+          of the identical indel in several independent functional lineages is
+          biologically implausible, so the parsimonious biological reading is an
+          ancestral indel preserved in the functional lineages and lost -- via
+          random post-pseudogenization mutations -- in the pseudogenized ones.
+          Set to 0 to disable (minimum meaningful value is 2). Requires tip ORF
+          status (always available in the normal pipeline).
 
     ---------------------------------------------------------------------------
     EXECUTION OPTIONS
@@ -439,7 +473,6 @@ def print_long_help():
         <gene>.orf_transitions_by_branch.tsv
         <gene>.pensieve_tree.nwk
         <gene>.internode_label_crosswalk.tsv
-        <gene>.indelmap_concordance.tsv
         <gene>.pseudogenization_tree.pdf/.png
         <gene>.event_map.pdf/.png
 
@@ -452,8 +485,7 @@ def print_long_help():
       * Breakpoint homology depends on alignment quality. A curated defined
         alignment remains the user's responsibility and is never rewritten.
       * Gap-as-character parsimony is deliberately transparent but does not
-        model every property of indel evolution. IndelMaP is retained as an
-        independent indel-aware comparison when available.
+        model every property of indel evolution.
       * Exact parsimony ties are uncertainty, not evidence. Pensieve reports
         them rather than converting a tie into a confident deletion/insertion.
       * codeml posterior support describes its substitution scaffold, not the
@@ -483,9 +515,9 @@ def build_parser():
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--alignment", choices=["perform", "defined"], default="perform")
     parser.add_argument("--dated", choices=["yes", "no"], default="yes")
-    parser.add_argument("--indelmap", choices=["auto", "yes", "no"], default="auto")
     parser.add_argument("--tie-break", choices=["none", "ancestral", "terminal"], default="none")
     parser.add_argument("--breakpoint-tolerance", type=int, default=0)
+    parser.add_argument("--min-functional-witnesses", type=int, default=2)
     parser.add_argument("--run_from_step", "--run-from-step", default="AUTO")
     parser.add_argument("--run_up_to", "--run-up-to", default="FULL")
     parser.add_argument("--clean", action="store_true")
@@ -596,11 +628,11 @@ def main():
         "--alignment", args.alignment, "--dated", args.dated,
         "--run_from_step", run_from, "--run_up_to", run_up_to,
         "--paml-mode", paml_mode, "--dat-dir", str(dat_dir),
-        "--indelmap-dir", str(root / "external" / "indelMaP"), "--env-name", args.env_name,
+        "--env-name", args.env_name,
         "--on-missing-root-sequence", args.on_missing_root_sequence,
-        "--indelmap", args.indelmap,
         "--tie-break", args.tie_break,
         "--breakpoint-tolerance", str(args.breakpoint_tolerance),
+        "--min-functional-witnesses", str(args.min_functional_witnesses),
     ]
     if args.clean:
         base_cmd.append("--clean")

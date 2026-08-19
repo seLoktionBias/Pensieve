@@ -1,19 +1,17 @@
 SHELL := /bin/bash
 ENV_NAME := Pensieve
-INDELMAP_URL := https://github.com/acg-team/indelMaP.git
 
-.PHONY: install env env-mamba env-conda env-staged venv current download-indelmap test clean help
+.PHONY: install env env-mamba env-conda env-staged venv current test clean help
 
 help:
 	@echo "Pensieve Makefile"
-	@echo "  make install            Portable auto install (mamba, then conda) + optional IndelMaP"
+	@echo "  make install            Portable auto install (mamba, then conda)"
 	@echo "  make env                Create/update env only with auto backend"
 	@echo "  make env-mamba          Create/update named environment with mamba"
 	@echo "  make env-conda          Create/update named environment with conda"
 	@echo "  make env-staged         Lower-solve-pressure staged mamba/conda installation"
 	@echo "  make venv               Create PACKAGE/.venv and install Python dependencies"
 	@echo "  make current            Install Python dependencies into current Python; no env"
-	@echo "  make download-indelmap  Clone/update optional IndelMaP"
 	@echo "  make test               Run Pensieve smoke tests"
 	@echo "  make clean              Remove temporary test files"
 
@@ -35,16 +33,6 @@ venv:
 current:
 	bash install.sh --env-only --backend=current
 
-download-indelmap:
-	mkdir -p external
-	@if [ -d external/indelMaP/.git ]; then \
-		echo "Updating existing external/indelMaP"; \
-		cd external/indelMaP && git pull; \
-	else \
-		echo "Cloning IndelMaP into external/indelMaP"; \
-		rm -rf external/indelMaP; \
-		git clone $(INDELMAP_URL) external/indelMaP; \
-	fi
 
 install:
 	bash install.sh

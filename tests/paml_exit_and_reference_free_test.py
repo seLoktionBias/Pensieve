@@ -118,7 +118,7 @@ def test_slow_codeml_stopped_before_joint_reconstruction():
         start = time.monotonic()
         r = subprocess.run([
             str(ROOT / "scripts/02_run_asr_backends.sh"),
-            "--gene", "T", "--workdir", str(work), "--indelmap", "no"
+            "--gene", "T", "--workdir", str(work)
         ], capture_output=True, text=True, env=env, timeout=hang_seconds)
         elapsed = time.monotonic() - start
         check(r.returncode == 0,
@@ -214,7 +214,7 @@ with outnt.open('w') as n, outaa.open('w') as a:
         r = subprocess.run([
             str(ROOT / "scripts/run_one_gene_00_to_04.sh"),
             "--gene", "T", "--fasta", str(fa), "--tree", str(tree),
-            "--workdir", str(work), "--run_up_to", "diagnostics", "--indelmap", "no"
+            "--workdir", str(work), "--run_up_to", "diagnostics"
         ], capture_output=True, text=True, env=env)
         check(r.returncode == 0, f"diagnostics run used to purge legacy files ({r.stderr[-120:]})")
         check(all(not f.exists() for f in legacy),
@@ -230,7 +230,7 @@ def test_nonzero_codeml_with_complete_marginal_continues():
         env = os.environ.copy(); env["PATH"] = f"{bindir}:{env['PATH']}"
         r = subprocess.run([
             str(ROOT / "scripts/02_run_asr_backends.sh"),
-            "--gene", "T", "--workdir", str(work), "--indelmap", "no"
+            "--gene", "T", "--workdir", str(work)
         ], capture_output=True, text=True, env=env)
         check(r.returncode == 0,
               f"backend continues after codeml exit 1 when marginal ASR is complete ({r.stderr[-220:]})")
@@ -352,7 +352,7 @@ def test_nonzero_codeml_with_incomplete_marginal_fails():
         env = os.environ.copy(); env["PATH"] = f"{bindir}:{env['PATH']}"
         r = subprocess.run([
             str(ROOT / "scripts/02_run_asr_backends.sh"),
-            "--gene", "T", "--workdir", str(work), "--indelmap", "no"
+            "--gene", "T", "--workdir", str(work)
         ], capture_output=True, text=True, env=env)
         check(r.returncode != 0, "backend still fails when the marginal ASR is incomplete")
         status = read_tsv(r2 / "02_T.codeml_run_status.tsv")

@@ -4,7 +4,7 @@
 These tests are intentionally targeted at the failure modes discussed during
 v3.25 review: canonical alignment preparation, breakpoint decomposition,
 parsimony ties, STOP retention, runner orchestration and lesion-aware ORF
-history. They do not claim biological validation of MACSE/PAML/IndelMaP.
+history. They do not claim biological validation of MACSE/PAML.
 """
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ def write_table(path, header, rows):
 
 def test_static_and_cli():
     print("static architecture and CLI")
-    check((ROOT / "VERSION").read_text().strip() == "4.2", "VERSION is 4.2")
+    check((ROOT / "VERSION").read_text().strip() == "4.5", "VERSION is 4.5")
     ctl = (ROOT / "templates" / "dummy_codon_asr.ctl").read_text()
     for token, msg in [
         ("clock = 0", "codeml clock=0"),
@@ -97,15 +97,17 @@ def test_static_and_cli():
         check(f"def {obsolete}" not in integrator, f"dead legacy integration helper removed: {obsolete}")
     check("Nodes X to Y are ancestral" in integrator and "tip_count - 2" not in integrator,
           "PAML ASR completeness is driven by rst declaration, not n-2 guesswork")
-    for opt in ['--indelmap', '--tie-break', '--breakpoint-tolerance']:
+    for opt in ['--min-functional-witnesses', '--tie-break', '--breakpoint-tolerance']:
         check(opt in (ROOT / "bin" / "pensieve").read_text(), f"top-level CLI forwards {opt}")
+    check('--indelmap' not in (ROOT / "bin" / "pensieve").read_text(),
+          "IndelMaP has been removed from the top-level CLI")
 
     for args in [["-h"], ["-help"], ["--help"], ["--help", "-long"]]:
         r = subprocess.run([sys.executable, str(ROOT / "bin" / "pensieve"), *args], capture_output=True, text=True)
         check(r.returncode == 0 and "Pensieve" in r.stdout, f"help form {' '.join(args)} works")
     long_help = subprocess.run([sys.executable, str(ROOT / "bin" / "pensieve"), "--help", "-long"],
                                capture_output=True, text=True).stdout
-    check("Pensieve v4.2 - full manual" in long_help, "long help reports v4.2")
+    check("Pensieve v4.5 - full manual" in long_help, "long help reports v4.5")
     check("diagnostics < alignment < events < asr < integrate < plot" in long_help,
           "long help documents actual stage order")
 
@@ -119,9 +121,56 @@ def test_breakpoint_decomposition():
     check(mod.decompose_run((646, 687), intervals, 0) == [(646, 687)],
           "independent interior run does not split the shared Miniopterus core")
     check(mod.gap_runs("AA---AA-A") == [(3, 5), (8, 8)], "maximal gap runs are detected")
+    # v4.4: the shared core is decomposed RECURSIVELY, so a run is broken into
+    # the same atomic segments regardless of which larger run it came from. Real
+    # GRK7 shape: an all-gap column 61 makes ferrumequinum a 1 bp (61,61) run,
+    # most species a (61,66) run, and Molossus a longer (61,71) run. All three
+    # must agree on the shared (61,61) and (62,66) atoms; Molossus then owns only
+    # its genuine (67,71) extension, not a spurious undecomposed (61,66) core
+    # that clusters as a Molossus-only 61-66 indel over an all-gap span.
+    grk = [(61, 61), (61, 66), (61, 71)]
+    check(mod.decompose_run((61, 66), grk, 0) == [(61, 61), (62, 66)],
+          "the 61-66 run splits at the all-gap column into (61,61)+(62,66)")
+    check(mod.decompose_run((61, 71), grk, 0) == [(61, 61), (62, 66), (67, 71)],
+          "the longer 61-71 run decomposes its core consistently, not as an undecomposed (61,66)")
 
 
-def run_event_case(tmp: Path, tree_text: str, seqs: dict[str, str], masked_rows=None, gene="T"):
+def test_long_deletion_does_not_manufacture_a_spurious_shared_core_event():
+    # End-to-end guard for the GRK7/Molossus_molossus bug: an all-gap column
+    # (col 7 here) sits at the left edge of an insertion carried by ONE tip (C,
+    # residues at 8-12) while a DIFFERENT tip (D) carries a longer deletion
+    # (7-15) covering the same left edge. The shared 7-12 span must never be
+    # emitted as a D-only indel event -- only C's real insertion (8-12) and D's
+    # own extension (13-15) are genuine events there.
+    print("a long deletion sharing an all-gap left edge does not manufacture a spurious 7-12 event")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        seqs = {
+            "A": "ATGAAA------AAGACC",   # gap 7-12  (majority)
+            "B": "ATGAAA------AAGACC",   # gap 7-12  (majority)
+            "E": "ATGAAA------AAGACC",   # gap 7-12  (majority)
+            "C": "ATGAAA-CCGGGAAGACC",   # gap 7 only; residues 8-12 = its own insertion
+            "D": "ATGAAA---------ACC",   # gap 7-15  (a longer deletion)
+        }
+        out = run_event_case(tmp, "((A:1,B:1):1,(E:1,(C:1,D:1):1):1);", seqs)
+        events = tsv(out / "03_T.alignment_events.tsv")
+        indels = [e for e in events if e["character_class"] == "indel"]
+        span_7_12 = [e for e in indels if e["alignment_start"] == "7" and e["alignment_end"] == "12"]
+        check(span_7_12 == [],
+              f"no indel event spans exactly the shared all-gap-edged 7-12 region ({span_7_12})")
+        d_over_insertion = [e for e in indels if e["affected_tips"] == "D"
+                            and int(e["alignment_start"]) <= 12 and int(e["alignment_end"]) >= 8
+                            and int(e["alignment_start"]) <= 8]
+        check(d_over_insertion == [],
+              f"the long-deletion tip D is not reported as its own event over C's insertion region ({d_over_insertion})")
+        d_extension = [e for e in indels if e["affected_tips"] == "D"
+                       and e["alignment_start"] == "13" and e["alignment_end"] == "15"]
+        check(len(d_extension) == 1,
+              f"D still keeps its own genuine 13-15 extension deletion ({[e['alignment_start']+'-'+e['alignment_end'] for e in indels if e['affected_tips']=='D']})")
+
+
+def run_event_case(tmp: Path, tree_text: str, seqs: dict[str, str], masked_rows=None, gene="T",
+                   orf_status_rows=None, extra_args=None):
     tree = tmp / "tree.nwk"; tree.write_text(tree_text + ("\n" if not tree_text.endswith("\n") else ""))
     aln = tmp / "aln.fa"; aln.write_text("".join(f">{k}\n{v}\n" for k, v in seqs.items()))
     out = tmp / "events"
@@ -134,9 +183,58 @@ def run_event_case(tmp: Path, tree_text: str, seqs: dict[str, str], masked_rows=
                   "pseudogenizing_event_candidate", "independent_stop_candidate", "frame_shifted_at_stop"]
         write_table(m, header, masked_rows)
         cmd += ["--masked-stops", str(m)]
+    if orf_status_rows is not None:
+        o = tmp / "orf_status.tsv"
+        write_table(o, ["gene", "species", "complete_orf"], orf_status_rows)
+        cmd += ["--orf-status", str(o)]
+    if extra_args:
+        cmd += extra_args
     r = subprocess.run(cmd, capture_output=True, text=True)
-    check(r.returncode == 0, f"event engine runs ({r.stderr[:120]})")
+    check(r.returncode == 0, f"event engine runs ({r.stderr[:200]})")
     return out
+
+
+def test_functional_consensus_fixes_shared_indel_as_ancestral():
+    # Real GUCY2F/column-2772 case: a 1 bp deletion carried by two independent
+    # FUNCTIONAL (complete-ORF) lineages (A in clade (A,B), D in clade (D,E)) must
+    # be reconstructed as ancestral (present at their common ancestor and lost in
+    # the residue-carriers), NOT as an implausible independent deletion gained
+    # convergently on each functional branch.
+    print("an indel shared by independent functional lineages is fixed as ancestral, not convergent gains")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        # col 5 is a gap in A and D (functional carriers); a residue in B, C, E.
+        seqs = {"A": "ATGA-ACCC", "B": "ATGAAACCC", "C": "ATGAAACCC",
+                "D": "ATGA-ACCC", "E": "ATGAAACCC"}
+        orf = [{"gene": "T", "species": s, "complete_orf": (s in ("A", "D"))} for s in "ABCDE"]
+        # WITH the rule (default min 2): the col-5 indel is fixed ancestral.
+        out = run_event_case(tmp, "((A:1,B:1):1,(C:1,(D:1,E:1):1):1);", seqs, orf_status_rows=orf,
+                             extra_args=["--min-functional-witnesses", "2"])
+        chars = {c["character_id"]: c for c in tsv(out / "03_T.alignment_characters.tsv")}
+        col5 = [c for c in chars.values() if c["alignment_start"] == "5" and c["alignment_end"] == "5"]
+        check(len(col5) == 1 and col5[0]["functional_ancestral_indel"] == "True",
+              "the col-5 indel shared by two independent functional lineages is flagged functional_ancestral_indel")
+        check(col5[0]["root_state"] == "present",
+              "the shared functional indel is reconstructed present at the root (ancestral)")
+        events = tsv(out / "03_T.alignment_events.tsv")
+        cid = col5[0]["character_id"]
+        gains_on_functional = [e for e in events if e["character_class"] == "indel"
+                               and cid in e["event_id"] and e["event_type"] == "indel_gain"
+                               and e["affected_tips"] in ("A", "D")]
+        check(gains_on_functional == [],
+              f"neither functional lineage carries an independent deletion of the ancestral indel ({gains_on_functional})")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        seqs = {"A": "ATGA-ACCC", "B": "ATGAAACCC", "C": "ATGAAACCC",
+                "D": "ATGA-ACCC", "E": "ATGAAACCC"}
+        orf = [{"gene": "T", "species": s, "complete_orf": (s in ("A", "D"))} for s in "ABCDE"]
+        # Rule disabled (0): the col-5 indel is not forced ancestral.
+        out = run_event_case(tmp, "((A:1,B:1):1,(C:1,(D:1,E:1):1):1);", seqs, orf_status_rows=orf,
+                             extra_args=["--min-functional-witnesses", "0"])
+        chars = {c["character_id"]: c for c in tsv(out / "03_T.alignment_characters.tsv")}
+        col5 = [c for c in chars.values() if c["alignment_start"] == "5" and c["alignment_end"] == "5"]
+        check(len(col5) == 1 and col5[0]["functional_ancestral_indel"] == "False",
+              "--min-functional-witnesses 0 disables the rule (indel not forced ancestral)")
 
 
 
@@ -536,13 +634,14 @@ def test_build_stop_registry_rejects_non_contiguous_codon_mapping():
     # wedged between raw nt 7 and 8 (columns 7,9,10 -- not contiguous, and
     # the 7..10 span is 4 columns wide, not a clean 3bp codon window).
     canonical_source = {"X": "ATGAAAT!GACCC"}
+    raw_by_species = {"X": "ATGAAATGACCC"}
     raw_stops = [{
         "species": "X", "raw_codon_position": 3, "raw_nt_start": 7, "raw_nt_end": 9,
         "stop_codon": "TGA", "frame_shifted_at_stop": False,
         "upstream_macse_marker_count": 0, "upstream_macse_frame_correction_mod3": 0,
         "stop_phase_interpretation": "raw_stop_independent_candidate",
     }]
-    registry = mod.build_stop_registry("T", raw_stops, canonical_source, True, "macse_codon_alignment")
+    registry = mod.build_stop_registry("T", raw_stops, canonical_source, raw_by_species, "macse_codon_alignment")
     check(len(registry) == 1, "one registry row produced")
     row = registry[0]
     check(row["mapped_columns_contiguous"] is False, f"non-contiguous mapping correctly detected ({row})")
@@ -554,10 +653,66 @@ def test_build_stop_registry_rejects_non_contiguous_codon_mapping():
     # inside the codon) must be accepted, confirming the rejection above is
     # specifically about contiguity, not some other regression.
     clean_source = {"X": "ATGAAATGACCC"}
-    clean_registry = mod.build_stop_registry("T", raw_stops, clean_source, True, "macse_codon_alignment")
+    clean_registry = mod.build_stop_registry("T", raw_stops, clean_source, raw_by_species, "macse_codon_alignment")
     crow = clean_registry[0]
     check(crow["mapped_columns_contiguous"] is True and crow["pseudogenizing_event_candidate"] is True,
           f"the identical raw STOP is accepted once its mapping is contiguous ({crow})")
+
+
+def test_build_stop_registry_rejects_off_frame_codon_coincidence():
+    # Real bug, found running real CNGA3 data (reported directly by the
+    # user, confirmed and shown to them directly): a raw STOP can map to
+    # THREE CONTIGUOUS canonical alignment columns that DO spell TAA/TAG/TGA
+    # -- passing both the old contiguous and codon_confirmed gates -- while
+    # still being pure coincidence, because those three columns do not
+    # start on a real codon boundary of the alignment's own shared codon
+    # frame. This happens whenever a species has an earlier synthetic
+    # insertion (from an accepted conserved-block/frame correction) that is
+    # itself frame-neutral in aggregate (its own total length happens to be
+    # a multiple of 3) but still shifts which alignment COLUMN each later
+    # raw position falls on relative to the codon grid, because the raw
+    # premature-stop scanner (00_prune_and_check_orf.py) numbers codons by
+    # counting from raw position 1 with no knowledge of any correction.
+    #
+    # Minimal real-shape reproduction: raw "ATGAAATGACCC" has a genuine raw-
+    # frame stop (TGA) at raw nt 7-9, a clean codon boundary in raw terms.
+    # A single synthetic 'N' inserted earlier (between raw nt 1 and 2) --
+    # itself node-for-node exactly the same shape as the real CNGA3 case --
+    # shifts every later raw position's alignment column by +1, so raw nt
+    # 7-9 now maps to alignment columns 8-10: still contiguous, still
+    # spells "TGA" verbatim (the underlying characters never change), but
+    # column 8 is NOT a codon boundary (columns 1-3/4-6/7-9/10-12 are; (8-1)
+    # mod 3 = 1, not 0) -- it is the tail of the real codon at columns 7-9
+    # plus the head of the real codon at columns 10-12, not a real codon.
+    print("build_stop_registry rejects a contiguous, textually-matching STOP that isn't on a real codon boundary")
+    mod = load("02_prepare_asr_inputs")
+    canonical_source = {"X": "A" + "N" + "TGAAATGACCC"}  # 13 columns; raw nt 7-9 -> columns 8-10
+    raw_by_species = {"X": "ATGAAATGACCC"}
+    raw_stops = [{
+        "species": "X", "raw_codon_position": 3, "raw_nt_start": 7, "raw_nt_end": 9,
+        "stop_codon": "TGA", "frame_shifted_at_stop": False,
+        "upstream_macse_marker_count": 0, "upstream_macse_frame_correction_mod3": 0,
+        "stop_phase_interpretation": "raw_stop_independent_candidate",
+    }]
+    registry = mod.build_stop_registry("T", raw_stops, canonical_source, raw_by_species, "macse_codon_alignment")
+    row = registry[0]
+    check(row["primary_alignment_start"] == 8 and row["mapped_columns_contiguous"] is True,
+          f"the STOP maps to a contiguous 3-column span starting at column 8 ({row})")
+    check(row["codon_frame_aligned"] is False,
+          f"column 8 is correctly identified as NOT a real codon boundary ({row})")
+    check(row["pseudogenizing_event_candidate"] is False and row["independent_stop_candidate"] is False,
+          f"an off-frame textual coincidence is never a pseudogenizing_event_candidate, even though it "
+          f"spells a stop codon verbatim ({row})")
+    check("does_not_start_on_a_real_codon_boundary" in row["reason"], f"reason explains the rejection ({row['reason']})")
+
+    # Control: the identical raw STOP without the earlier synthetic 'N' (so
+    # raw nt 7-9 maps to its own natural codon boundary, columns 7-9) must
+    # still be accepted -- confirming the rejection above is specifically
+    # about frame alignment, not a regression in the ordinary case.
+    clean_registry = mod.build_stop_registry("T", raw_stops, {"X": "ATGAAATGACCC"}, raw_by_species, "macse_codon_alignment")
+    crow = clean_registry[0]
+    check(crow["codon_frame_aligned"] is True and crow["pseudogenizing_event_candidate"] is True,
+          f"the same STOP is accepted once it lands on a real codon boundary ({crow})")
 
 
 def test_frame_dependent_stop_not_resurrected_by_coincidental_allele_match():
@@ -625,6 +780,19 @@ def test_terminal_stop_stripped_from_every_input_sequence():
           "trailing alignment gaps after a real terminal stop are preserved, only the 3 real bases are removed")
     check(len(mod.strip_terminal_stop("ATGAAACCCTGA")) == len("ATGAAACCCTGA") - 3,
           "exactly 3 characters are removed, never more")
+    # v4.4: for --alignment defined the alignment width is authoritative and
+    # must not change. preserve_width removes the terminal stop by GAPPING its
+    # three real bases in place, wherever they fall (before trailing gaps),
+    # instead of deleting them -- otherwise only some rows shorten and the
+    # alignment desynchronises (real PDE6C/CNGB3/GUCY2F data).
+    check(mod.strip_terminal_stop("ATGAAACCCTGA", preserve_width=True) == "ATGAAACCC---",
+          "preserve_width gaps the terminal stop in place instead of deleting it")
+    check(mod.strip_terminal_stop("ATGAAACCCTGA---", preserve_width=True) == "ATGAAACCC------",
+          "preserve_width gaps the 3 real stop bases even when trailing gaps follow, keeping total width")
+    check(len(mod.strip_terminal_stop("ATGAAACCCTGA", preserve_width=True)) == len("ATGAAACCCTGA"),
+          "preserve_width never changes the sequence length (alignment columns are preserved)")
+    check(mod.strip_terminal_stop("ATGAAACCCGGG", preserve_width=True) == "ATGAAACCCGGG",
+          "preserve_width still leaves a non-stop terminal codon untouched")
 
 
 def make_step_dirs(tmp: Path, gene="T"):
@@ -690,6 +858,87 @@ def test_canonical_alignment_prepare():
         prov = tsv(r2 / "02_T.alignment_provenance.tsv")[0]
         check(prov["defined_alignment_columns_modified"] == "False" and prov["second_alignment_performed"] == "False",
               "defined mode records that no column insertion/re-alignment occurred")
+
+
+def test_defined_alignment_direct_codon_stop_scan_without_macse():
+    # v4.4: --alignment defined detects premature stops by reading the codon
+    # alignment directly (no MACSE, no raw->alignment remap). This test does
+    # NOT create any 01_*.macse_* file at all, proving step 02 defined mode
+    # never depends on MACSE output. C carries an internal in-frame TGA at
+    # codon 3 (columns 7-9) plus a natural terminal TAA at codon 4; only the
+    # internal one may found an independent nonsense event, and both stops must
+    # be masked to NNN for the codeml-safe view while native retains them.
+    print("--alignment defined detects premature stops by direct codon-frame scan, no MACSE required")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td); r0, r1, r2 = make_step_dirs(tmp)
+        defined = {"A":"ATGAAAGGGCCC", "B":"ATGAAAGGGCCC", "C":"ATGAAATGATAA", "D":"ATGAAAGGGCCC"}
+        (r0 / "00_T.common_species.fasta").write_text("".join(f">{k}\n{v}\n" for k,v in defined.items()))
+        write_table(r0 / "00_T.orf_failures.tsv",
+                    ["gene","species","failure_type","codon_position","nt_start","nt_end","codon","details"], [])
+        r = subprocess.run([sys.executable, str(ROOT/"scripts"/"02_prepare_asr_inputs.py"),
+                            "--gene","T","--results01-dir",str(r1),"--results00-dir",str(r0),
+                            "--outdir",str(r2),"--alignment-mode","defined"], capture_output=True, text=True)
+        check(r.returncode == 0, f"defined-mode scan runs with no MACSE file present ({r.stderr[:160]})")
+        native = fasta(r2 / "02_T.primary_codon_alignment_native.fasta")
+        safe = fasta(r2 / "02_T.primary_codon_alignment.fasta")
+        check(native["C"][6:9] == "TGA", "native view retains C's internal stop allele unchanged")
+        check(safe["C"][6:9] == "NNN" and safe["C"][9:12] == "NNN",
+              "PAML-safe view masks BOTH C's internal stop and its terminal stop to NNN")
+        # no stop codons whatsoever survive into the codeml-safe alignment
+        surviving = [safe[s][i:i+3] for s in safe for i in range(0, len(safe[s]), 3)
+                     if safe[s][i:i+3] in {"TAA","TAG","TGA"}]
+        check(surviving == [], f"no stop codon survives in the PAML-safe alignment ({surviving})")
+        stops = tsv(r2 / "02_T.masked_inframe_premature_stops_after_macse_correction.tsv")
+        internal = [x for x in stops if x["species"]=="C" and x["primary_alignment_start"]=="7"]
+        terminal = [x for x in stops if x["species"]=="C" and x["primary_alignment_start"]=="10"]
+        check(len(internal)==1 and internal[0]["stop_codon"]=="TGA"
+              and internal[0]["pseudogenizing_event_candidate"]=="True"
+              and internal[0]["independent_stop_candidate"]=="True",
+              "the internal TGA is registered as an independent premature-stop candidate at its exact columns")
+        check(len(terminal)==1 and terminal[0]["terminal_codon"]=="True"
+              and terminal[0]["pseudogenizing_event_candidate"]=="False",
+              "the terminal stop is recorded but excluded from founding an event")
+        prov = tsv(r2 / "02_T.alignment_provenance.tsv")[0]
+        check(prov["aligner"]=="NA" and prov["premature_stop_detection"].startswith("direct_codon_frame_scan"),
+              "provenance records the MACSE-free direct codon-frame stop detection")
+
+
+def test_prepare_defined_alignment_frame_fix_and_masking():
+    # v4.4: prepare_defined_alignment.py makes a curated alignment ready for
+    # --alignment defined using ONLY mechanical, data-preserving operations:
+    # mask flagged assembly gaps ('-' -> 'N') and trim leading/trailing all-gap
+    # padding so the length becomes a codon multiple. Internal all-gap columns
+    # (real codon-frame insertion columns) and every real base are untouched.
+    print("prepare_defined_alignment: trailing all-gap trim to codon frame + assembly-gap masking")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        # length 11: internal all-gap column at index 3 (kept), trailing all-gap
+        # columns 9-10 (trimmed -> length 9, a codon multiple). A carries a
+        # per-species gap at index 6 that a mask region rewrites to N.
+        aln = {"A":"ATG-AA-CC--", "B":"ATG-AATCC--", "C":"ATG-TATCC--"}
+        (tmp/"in.fa").write_text("".join(f">{k}\n{v}\n" for k,v in aln.items()))
+        (tmp/"mask.txt").write_text("A\t7\t7\n")  # 1-based col 7 = A's gap at index 6
+        r = subprocess.run([sys.executable, str(ROOT/"scripts"/"prepare_defined_alignment.py"),
+                            "--in", str(tmp/"in.fa"), "--mask-regions", str(tmp/"mask.txt"),
+                            "--out", str(tmp/"out.fa")], capture_output=True, text=True)
+        check(r.returncode == 0, f"preprocessing runs ({r.stderr[:160]})")
+        out = fasta(tmp/"out.fa")
+        L = {len(v) for v in out.values()}
+        check(L == {9}, f"output is trimmed to a single codon-multiple length ({L})")
+        check(out["A"][6] == "N", "a flagged assembly gap is rewritten to N")
+        check(out["B"] == "ATG-AATCC" and out["C"] == "ATG-TATCC",
+              "real bases and the internal all-gap column are preserved untouched")
+        check(all(v[3] == "-" for v in out.values()),
+              "the internal all-gap codon-frame column is retained, not removed")
+    # Refuses (does not mangle) when the residual is genuinely out of frame.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        offframe = {"A":"ATGAACC", "B":"ATGAACC"}  # length 7, no all-gap padding to trim
+        (tmp/"in.fa").write_text("".join(f">{k}\n{v}\n" for k,v in offframe.items()))
+        r = subprocess.run([sys.executable, str(ROOT/"scripts"/"prepare_defined_alignment.py"),
+                            "--in", str(tmp/"in.fa"), "--out", str(tmp/"out.fa")], capture_output=True, text=True)
+        check(r.returncode != 0 and not (tmp/"out.fa").exists(),
+              "a genuinely off-frame alignment is refused, not silently trimmed")
 
 
 def test_phylogenetic_sequence_ordering():
@@ -798,7 +1047,7 @@ with outnt.open('w') as n, outaa.open('w') as a:
         env = os.environ.copy(); env["PATH"] = f"{bindir}:{env['PATH']}"
         r = subprocess.run([str(ROOT/"scripts"/"run_one_gene_00_to_04.sh"),
                             "--gene","T","--fasta",str(fa),"--tree",str(tree),"--workdir",str(work),
-                            "--run_up_to","events","--alignment","perform","--indelmap","no"],
+                            "--run_up_to","events","--alignment","perform"],
                            capture_output=True, text=True, env=env)
         check(r.returncode == 0, f"runner reaches events without missing step02 file ({r.stderr[-180:]})")
         check((work/"results_02/T/02_T.codon_for_paml.phy").stat().st_size > 0,
@@ -861,7 +1110,7 @@ Path('codon_asr.out').write_text('mock codeml output\n')
         env = os.environ.copy(); env["PATH"] = f"{bindir}:{env['PATH']}"
         r = subprocess.run([str(ROOT/"scripts"/"run_one_gene_00_to_04.sh"),
                             "--gene","T","--fasta",str(fa),"--tree",str(tree),"--workdir",str(work),
-                            "--run_up_to","integrate","--alignment","perform","--indelmap","no"],
+                            "--run_up_to","integrate","--alignment","perform"],
                            capture_output=True, text=True, env=env)
         check(r.returncode == 0, f"runner reaches integration without v3.25 wiring failures ({r.stderr[-220:]})")
         expected = [
@@ -929,16 +1178,56 @@ Overall accuracy of the reconstruction
               "root ORF status remains unavailable rather than invented")
 
 
+def test_partial_orf_status_distinguishes_truncation_from_pseudogenization():
+    # v4.4: ORF status is three-way. A complete ORF is intact; an internal
+    # premature stop or an internal (non-terminal) frameshift is disrupted
+    # (pseudogenized); an incomplete sequence with NEITHER is "partial" --
+    # incomplete is not evidence of pseudogenization (real GRK7 Cynopterus case).
+    print("ORF status: incomplete-but-clean is partial, internal frameshift/stop is disrupted")
+    mod = load("04_ancestral_orf_walk")
+    check(mod.orf_check("ATGAAACCCTAA")["coding_status"] == "intact",
+          "a complete ORF (ATG, mod3, no internal stop) is intact")
+    check(mod.orf_check("ATGAAACC----")["coding_status"] == "partial",
+          "a 3'-truncated sequence with no internal frameshift/stop is partial")
+    check(mod.orf_check("GTGAAACCCGGG")["coding_status"] == "partial",
+          "a missing start codon alone is partial, not disrupted")
+    check(mod.orf_check("ATGTAACCCGGG")["coding_status"] == "disrupted",
+          "an internal premature stop is disrupted (pseudogenized)")
+    check(mod.orf_check("ATGAA-CCCGG")["coding_status"] == "disrupted",
+          "an internal non-mod3 gap (internal frameshift) is disrupted")
+    check(mod.orf_check("ATGA-AACCCGGG")["coding_status"] == "intact",
+          "a 1bp gap whose gap-stripped sequence is still a clean ORF stays intact (compensated/artifact)")
+    # has_internal_frameshift: only NON-terminal, non-mod3 gap runs count.
+    check(mod.has_internal_frameshift("--ATGAAACCC--") is False,
+          "leading/trailing gaps are truncation, never an internal frameshift")
+    check(mod.has_internal_frameshift("ATG-AACCC") is True,
+          "an internal 1bp gap is an internal frameshift")
+    check(mod.has_internal_frameshift("ATG---AACCC") is False,
+          "an internal 3bp gap removes a whole codon and preserves frame")
+    # step 03 terminal-incompleteness helper
+    ev = load("03_alignment_events")
+    occ = {"X": (1, 100)}
+    check(ev.event_is_terminal_incompleteness(occ, ["X"], 90, 100) is True,
+          "a 3'-terminal indel is flagged as terminal incompleteness")
+    check(ev.event_is_terminal_incompleteness(occ, ["X"], 1, 10) is True,
+          "a 5'-terminal indel is flagged as terminal incompleteness")
+    check(ev.event_is_terminal_incompleteness(occ, ["X"], 40, 50) is False,
+          "an interior indel is not terminal incompleteness")
+
+
 def test_root_adjacent_uncertainty_is_explicit():
     print("root-adjacent substitution-only disruption is explicit, not generic uncertain")
     with tempfile.TemporaryDirectory() as td:
         tmp=Path(td); out=tmp/"o"; out.mkdir()
         pens=tmp/"pens.nwk"; pens.write_text("((A:1,B:1)NodeAB:1,(C:1,D:1)NodeCD:1)UserRoot;\n")
         paml=tmp/"paml.nwk"; paml.write_text("((A:1,B:1)PAB:1,(C:1,D:1)PCD:1)PRoot;\n")
-        # PAB lacks ATG while PCD is intact. There is no explicit event character,
-        # so the UserRoot->NodeAB first-loss placement must remain unresolved.
-        asr=tmp/"asr.fa"; asr.write_text(">PAB\nGTGAAACCCGGG\n>PCD\nATGAAACCCGGG\n")
-        tips=tmp/"tips.fa"; tips.write_text(">A\nGTGAAACCCGGG\n>B\nGTGAAACCCGGG\n>C\nATGAAACCCGGG\n>D\nATGAAACCCGGG\n")
+        # PAB carries an internal premature stop (a substitution-only disruption)
+        # while PCD is intact. There is no explicit indel/stop event character, so
+        # the UserRoot->NodeAB first-loss placement must remain unresolved. (A mere
+        # missing ATG with no internal frameshift/stop is now "partial", not
+        # disrupted, so a genuine internal stop is used to exercise this pathway.)
+        asr=tmp/"asr.fa"; asr.write_text(">PAB\nATGTAACCCGGG\n>PCD\nATGAAACCCGGG\n")
+        tips=tmp/"tips.fa"; tips.write_text(">A\nATGTAACCCGGG\n>B\nATGTAACCCGGG\n>C\nATGAAACCCGGG\n>D\nATGAAACCCGGG\n")
         chars=tmp/"chars.tsv"; write_table(chars,["character_id","character_class","alignment_start","alignment_end","length_mod_3","stop_codon"],[])
         states=tmp/"states.tsv"; write_table(states,["character_id","node_label","state"],[])
         events=tmp/"events.tsv"; write_table(events,["event_id","branch","character_class","biological_interpretation","length_mod_3","direction_confident"],[])
@@ -1372,6 +1661,85 @@ def test_intact_parent_resets_history_for_independently_disabled_children():
               f"A2b gets its own fresh pseudogenization call, not inherited history ({br.get('A->A2b')})")
 
 
+def test_map_raw_nt_to_aln_skips_macse_synthetic_ambiguity_code():
+    # Real bug, found on real data (GUCA1C/Desmodus_rotundus, reported
+    # directly by the user). map_raw_nt_to_aln() used to treat every
+    # non-gap, non-'!' character in a MACSE alignment row as a real raw
+    # nucleotide. MACSE's own output can contain a literal ambiguity code
+    # like 'N' as a synthetic insertion -- not present in the raw input at
+    # all -- with no '!' involved. Treating it as real silently miscounted
+    # by one: in the real case, this shifted the 30-codon conserved-block
+    # boundary one raw nucleotide early for Desmodus_rotundus, so its real
+    # nucleotide exactly at the boundary (raw position 90, a 'C') fell
+    # between the accepted block and the remainder and was silently
+    # dropped -- then reported as a false single-nucleotide deletion event
+    # unique to that species.
+    print("map_raw_nt_to_aln correctly excludes a MACSE-synthetic 'N', not just '!'")
+    mod = load("01_run_macse_and_extract_events")
+    raw_seq = "ATGAAACCCGGG"  # 12 real raw nucleotides, no ambiguity
+    # A synthetic leading 'N' (matching no raw character) plus a real
+    # internal gap -- exactly the real-data shape (MACSE row for Desmodus
+    # started 'NTGGGC------AAT---...').
+    aligned = "N" + "ATGAAA" + "-" + "CCCGGG"
+    col = mod.map_raw_nt_to_aln(aligned, 6, raw_seq)
+    check(col == 7, f"synthetic leading 'N' is excluded from the raw-nucleotide count (got column {col}, expected 7)")
+    col_last = mod.map_raw_nt_to_aln(aligned, 12, raw_seq)
+    check(col_last == len(aligned),
+          f"the last real raw nucleotide still maps to the true final alignment column (got {col_last})")
+
+    # Control: a genuine 'N' actually present IN the raw sequence itself
+    # (real ambiguity in the original data, not a MACSE insertion) must
+    # still be counted as a real raw nucleotide, not skipped.
+    raw_with_n = "ATGNAACCCGGG"
+    aligned_with_n = "N" + "ATGNAA" + "-" + "CCCGGG"
+    col_genuine = mod.map_raw_nt_to_aln(aligned_with_n, 4, raw_with_n)
+    check(col_genuine == 5,
+          f"a genuine 'N' present in the raw sequence itself is still counted, not treated as synthetic (got {col_genuine})")
+
+
+def test_raw_to_alignment_map_survives_multiple_scattered_insertions():
+    # Real bug, found running the v4.3 fix above on real GUCA1C data: a
+    # naive single-pass greedy character match (advance on match, else
+    # skip) correctly handles ONE synthetic MACSE insertion, but perma-
+    # nently desynchronises as soon as there is a SECOND, independent one
+    # later in the same row -- once a real character fails to match by
+    # coincidence, greedy matching has no way to recover, and can stall
+    # with zero further matches for the rest of the sequence. On real data
+    # this blocked GUCA1C entirely: Desmodus_rotundus's own row had a
+    # synthetic insertion near the very start (the conserved-block
+    # boundary case) AND a second, unrelated one further into the gene,
+    # and greedy matching found no STOP-coordinate mapping anywhere past
+    # the first one. build_raw_to_alignment_map() uses a proper sequence
+    # alignment (difflib) instead, which does not have this failure mode.
+    print("raw-to-alignment map survives more than one synthetic insertion in the same row")
+    mod = load("01_run_macse_and_extract_events")
+    # A non-repetitive 30nt sequence (fixed seed) -- a sequence built from
+    # short repeated motifs (e.g. homopolymer-like runs) can give a generic
+    # sequence matcher more than one equally-short valid alignment to choose
+    # between, which is a property of the test data, not of real biological
+    # sequences at this length; a realistic-looking sequence avoids that
+    # confound entirely.
+    raw_seq = "AAGTTTAACAAATTATCTCGATCGGTTGAA"  # len 30, fixed-seed random
+    # Two independent synthetic insertions: an 'N' 10nt in, and a '!'
+    # partial-codon marker another 10nt later -- exactly the real
+    # GUCA1C/Desmodus_rotundus shape (an insertion at the conserved-block
+    # boundary, plus one more, unrelated, later in the gene).
+    aligned = raw_seq[:10] + "N" + raw_seq[10:20] + "!" + raw_seq[20:]
+    raw_map = mod.build_raw_to_alignment_map(aligned, raw_seq)
+    check(len(raw_map) == len(raw_seq),
+          f"every real raw position is mapped despite two separate synthetic insertions "
+          f"(mapped {len(raw_map)} of {len(raw_seq)})")
+    # The last real raw nucleotide must still be found, not lost to a stall
+    # after the first insertion.
+    check(len(raw_seq) in raw_map,
+          f"the last real raw nucleotide is still mapped (raw_map keys: {sorted(raw_map)})")
+    # Spot-check that mapped columns actually point at the matching character.
+    for raw_pos, col in raw_map.items():
+        check(aligned[col - 1].upper() == raw_seq[raw_pos - 1].upper(),
+              f"raw position {raw_pos} maps to column {col}, whose character "
+              f"({aligned[col-1]!r}) matches the raw base ({raw_seq[raw_pos-1]!r})")
+
+
 def test_block_realignment_always_produces_codon_multiple_width():
     # Real bug, found running real CNGA3 data (Bat_genes_from_Song):
     # realign_block_content() (scripts/01_run_macse_and_extract_events.py)
@@ -1441,6 +1809,68 @@ for outp in (nt_out, aa_out):
                   f"{name}'s own real (gap-stripped) content ({real!r}) is itself a whole number of codons")
 
 
+def test_block_realignment_does_not_trim_non_codon_multiple_candidates():
+    # Real bug, found running real GUCA1C data (reported directly by the
+    # user: Desmodus_rotundus's own real 'C' at raw position 90 silently
+    # vanished, misreported as a deletion). realign_block_content() used to
+    # trim every candidate to its own largest multiple of 3 before calling
+    # MACSE, inherited unmodified from the old, since-removed MUSCLE-based
+    # implementation where that trim was genuinely required (protecting
+    # translate_codon_seq from a desynchronising partial trailing codon).
+    # MACSE never had that requirement -- it aligns raw nucleotides directly
+    # and is exactly the tool designed to handle non-codon-multiple input.
+    # A block candidate can legitimately be non-codon-multiple in length
+    # because it contains a masked 'N' standing in for one of MACSE's own
+    # inferred positions -- and that 'N' is not necessarily trailing, so
+    # trimming from the end silently discarded real, already-accepted raw
+    # content (in the real case: an 'N' immediately followed by one real
+    # trailing nucleotide, both lost together to a 2-character end-trim).
+    print("block realignment never discards trailing real content from a non-codon-multiple candidate")
+    mod = load("01_run_macse_and_extract_events")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        bindir = tmp / "bin"; bindir.mkdir()
+        mock_macse = bindir / "macse"
+        # Records exactly what it received, untouched, as its own "alignment"
+        # (right-padded to the longest input) -- this test only needs to
+        # prove nothing was discarded before the aligner ever ran.
+        mock_macse.write_text(r'''#!/usr/bin/env python3
+import sys
+from pathlib import Path
+args = sys.argv[1:]
+def val(k): return args[args.index(k) + 1]
+inp = Path(val('-seq')); nt_out = Path(val('-out_NT')); aa_out = Path(val('-out_AA'))
+records = []
+name = None; chunks = []
+for line in inp.read_text().splitlines():
+    if line.startswith('>'):
+        if name is not None: records.append((name, ''.join(chunks)))
+        name = line[1:].split()[0]; chunks = []
+    else:
+        chunks.append(line.strip())
+if name is not None: records.append((name, ''.join(chunks)))
+width = max(len(s) for _, s in records)
+width += (3 - width % 3) % 3  # real MACSE always yields a codon-multiple output width
+for outp in (nt_out, aa_out):
+    with outp.open('w') as f:
+        for name, s in records:
+            f.write(f'>{name}\n{s.ljust(width, "-")}\n')
+''')
+        mock_macse.chmod(0o755)
+
+        # A: ordinary 9nt candidate (3 codons), needs no correction.
+        # B: an accepted MACSE edit ending in a masked 'N' immediately
+        # followed by ONE more real nucleotide -- 11 characters total, NOT
+        # a multiple of 3 (exactly the real GUCA1C/Desmodus_rotundus shape:
+        # "...GGAATAT" + masked N + real "C").
+        block_content = {"A": "ATGGGCGAG", "B": "ATGGGCGANC"}
+        aligned = mod.realign_block_content(block_content, str(mock_macse), tmp / "work", tmp / "macse.log")
+        check(aligned["B"].replace("-", "") == block_content["B"],
+              f"B's full candidate, including its trailing real nucleotide after the masked N, "
+              f"reaches the aligner untouched (got {aligned['B'].replace('-', '')!r}, "
+              f"expected {block_content['B']!r})")
+
+
 def test_no_muscle_in_active_runtime_code():
     # Mandatory acceptance criterion (v4.2): MUSCLE is removed completely.
     # There must be no --aligner option and no runtime code path that can
@@ -1470,6 +1900,8 @@ def main():
     test_static_and_cli()
     test_terminal_stop_stripped_from_every_input_sequence()
     test_breakpoint_decomposition()
+    test_long_deletion_does_not_manufacture_a_spurious_shared_core_event()
+    test_functional_consensus_fixes_shared_indel_as_ancestral()
     test_guca1b_breakpoint_history_end_to_end()
     test_contiguous_same_type_indel_fragments_are_merged_into_one_event()
     test_adjacent_different_type_indel_events_are_not_merged()
@@ -1481,12 +1913,16 @@ def main():
     test_shared_stop_not_missed_when_only_one_tip_is_registered()
     test_compensated_frameshift_stop_classification()
     test_build_stop_registry_rejects_non_contiguous_codon_mapping()
+    test_build_stop_registry_rejects_off_frame_codon_coincidence()
     test_frame_dependent_stop_not_resurrected_by_coincidental_allele_match()
     test_canonical_alignment_prepare()
+    test_defined_alignment_direct_codon_stop_scan_without_macse()
+    test_prepare_defined_alignment_frame_fix_and_masking()
     test_phylogenetic_sequence_ordering()
     test_runner_orchestration_through_events()
     test_runner_orchestration_through_integrate()
     test_mock_paml_integration_and_root_policy()
+    test_partial_orf_status_distinguishes_truncation_from_pseudogenization()
     test_root_adjacent_uncertainty_is_explicit()
     test_uncertain_root_resolves_to_intact_once_descendants_are_confidently_intact()
     test_ambiguous_in_frame_indel_does_not_force_node_uncertain()
@@ -1494,7 +1930,10 @@ def main():
     test_confident_disabling_events_never_override_a_genuinely_intact_child_orf()
     test_sparse_root_stop_evidence_does_not_poison_whole_tree()
     test_intact_parent_resets_history_for_independently_disabled_children()
+    test_map_raw_nt_to_aln_skips_macse_synthetic_ambiguity_code()
+    test_raw_to_alignment_map_survives_multiple_scattered_insertions()
     test_block_realignment_always_produces_codon_multiple_width()
+    test_block_realignment_does_not_trim_non_codon_multiple_candidates()
     test_no_muscle_in_active_runtime_code()
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")

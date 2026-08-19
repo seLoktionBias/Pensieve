@@ -2,14 +2,13 @@
 # Pensieve v3.32 ASR backends.
 #
 # The parent Pensieve process owns scheduling.  In --mode slurm the *whole*
-# pipeline runs inside one Slurm allocation; codeml and optional IndelMaP are
-# ordinary child processes in that allocation.  Nested Slurm submission is
-# intentionally disabled because it made failure propagation and resume logic
-# unreliable in earlier versions.
+# pipeline runs inside one Slurm allocation; codeml is an ordinary child process
+# in that allocation.  Nested Slurm submission is intentionally disabled because
+# it made failure propagation and resume logic unreliable in earlier versions.
 set -euo pipefail
 
 GENE=""; WORKDIR="$PWD"; THREADS=4; TIME_HOURS=24
-PAML_MODE="local"; ENV_NAME=""; INDELMAP_DIR=""; RUN_INDELMAP="no"
+PAML_MODE="local"; ENV_NAME=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -19,8 +18,7 @@ while [[ $# -gt 0 ]]; do
     --time-hours|--time) TIME_HOURS="$2"; shift 2;;
     --paml-mode) PAML_MODE="$2"; shift 2;;
     --env-name) ENV_NAME="$2"; shift 2;;
-    --indelmap) RUN_INDELMAP="$2"; shift 2;;
-    --indelmap-dir) INDELMAP_DIR="$2"; shift 2;;
+    --indelmap|--indelmap-dir) shift 2;;
     --child-job-registry|--slurm-account|--slurm-partition) shift 2;;
     --alignment|--dated|--run_from_step|--run-from-step|--run_up_to|--run-up-to|--dat-dir) shift 2;;
     *) echo "[ERROR] Unknown option: $1" >&2; exit 1;;
@@ -153,36 +151,5 @@ fi
 
 require_file "$PAML_DIR/rst" paml_rst
 require_file "$OUTDIR/02_${GENE}.paml_marginal_validation.tsv" paml_marginal_validation
-
-run_indelmap(){
-  local asr_dir="$OUTDIR/indelmap_asr"
-  local indelmap_asr="${INDELMAP_ASR:-$INDELMAP_DIR/src/indelMaP_ASR.py}"
-  mkdir -p "$asr_dir"
-  if [[ ! -s "$indelmap_asr" ]]; then
-    echo "[WARN] IndelMaP not found at $indelmap_asr; continuing without concordance." >&2
-    return 0
-  fi
-  require_file "$OUTDIR/02_${GENE}.nt_for_indelmap.fasta" step02_native_alignment_for_indelmap
-  echo "[$(date)] IndelMaP: optional independent concordance reconstruction"
-  set +e
-  ( cd "$asr_dir" && python "$indelmap_asr" \
-      --msa_file "../../../$OUTDIR/02_${GENE}.nt_for_indelmap.fasta" \
-      --tree_file "../../../$TREEFILE" \
-      --output_file "${GENE}.indelmap" \
-      --alphabet DNA \
-      --ancestral_reconstruction True ) > "$asr_dir/indelmap.log" 2>&1
-  status=$?
-  set -e
-  if [[ "$status" -ne 0 ]]; then
-    echo "[WARN] IndelMaP failed for $GENE; core Pensieve inference will continue." >&2
-    tail -60 "$asr_dir/indelmap.log" >&2 || true
-  fi
-}
-
-case "$RUN_INDELMAP" in
-  yes|true|1|auto) run_indelmap;;
-  no|false|0) echo "[$(date)] IndelMaP disabled; core inference is independent of it";;
-  *) echo "[ERROR] --indelmap must be yes/no/auto" >&2; exit 1;;
-esac
 
 echo "[$(date)] ASR backends complete for $GENE"

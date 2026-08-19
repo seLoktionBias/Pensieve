@@ -27,7 +27,6 @@ ENV_NAME="${PENSIEVE_ENV_NAME:-Pensieve}"
 ENV_FILE="$ROOT_DIR/environment.yml"
 PIP_FILE="$ROOT_DIR/requirements-pip.txt"
 VENV_PATH="${PENSIEVE_VENV_PATH:-$ROOT_DIR/.venv}"
-INDELMAP_URL="${PENSIEVE_INDELMAP_URL:-https://github.com/acg-team/indelMaP.git}"
 BACKEND="${PENSIEVE_INSTALL_BACKEND:-auto}"
 ENV_ONLY=0
 DRY_RUN=0
@@ -42,7 +41,7 @@ Options:
                               Installation method (default: auto)
   --env-name=NAME             Conda/mamba environment name (default: Pensieve)
   --venv-path=PATH            Python venv path (default: PACKAGE/.venv)
-  --env-only                  Do not clone/update optional IndelMaP
+  --env-only                  Deprecated no-op (retained for compatibility)
   --no-staged-fallback        Do not automatically retry a failed/killed
                               mamba or conda solve with the lower-memory
                               staged installer (default: retry automatically;
@@ -54,7 +53,6 @@ Environment variables:
   PENSIEVE_INSTALL_BACKEND    Same values as --backend
   PENSIEVE_ENV_NAME           Conda/mamba environment name
   PENSIEVE_VENV_PATH          Python virtual-environment path
-  PENSIEVE_INDELMAP_URL       Override IndelMaP git URL
   PENSIEVE_NO_STAGED_FALLBACK Same as --no-staged-fallback
 
 Examples:
@@ -121,8 +119,6 @@ For a full Pensieve run, these non-Python programs must also be available on PAT
   macse     frameshift-aware coding alignment
   codeml    PAML ancestral substitution reconstruction
   Rscript   plotting (with ape, ggplot2, dplyr, readr, stringr, tidyr, optparse)
-
-IndelMaP is optional concordance evidence and can be disabled with --indelmap no.
 NOTE
 }
 
@@ -265,25 +261,7 @@ EOF2
   esac
 }
 
-download_indelmap(){
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[Pensieve] would clone/update IndelMaP in $ROOT_DIR/external/indelMaP"
-    return 0
-  fi
-  have_cmd git || { echo "[WARN] git not found; skipping optional IndelMaP download" >&2; return 0; }
-  mkdir -p external
-  if [[ -d external/indelMaP/.git ]]; then
-    echo "[Pensieve] Updating existing external/indelMaP"
-    git -C external/indelMaP pull
-  else
-    echo "[Pensieve] Cloning IndelMaP into external/indelMaP"
-    rm -rf external/indelMaP
-    git clone "$INDELMAP_URL" external/indelMaP
-  fi
-}
-
 install_env || exit $?
-[[ "$ENV_ONLY" -eq 1 ]] || download_indelmap || exit $?
 
 cat <<EOF2
 

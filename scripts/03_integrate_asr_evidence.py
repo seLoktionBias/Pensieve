@@ -12,9 +12,6 @@ in addition to the degree-3 biological unrooted internodes.  Its marginal
 sequence is retained in a PAML-only audit FASTA but is never assigned to the
 biological dated root.  Degree-3 PAML internodes are transferred to the rooted
 reporting tree by exact root-independent tip tripartitions.
-
-IndelMaP, when available, is concordance evidence only.  It never overwrites
-Pensieve structural states or PAML nucleotide scaffolds.
 """
 from __future__ import annotations
 
@@ -562,72 +559,6 @@ def transfer_paml_labels_to_dated_tree_by_tripartition(paml_tree, reporting_tree
 
 
 # ---------------------------------------------------------------------------
-# Optional IndelMaP concordance.
-
-
-def indelmap_concordance(gene, r2, out, pensieve_tree):
-    # Matches indelMaP_ASR.py's own naming: it appends fixed suffixes to
-    # --output_file (e.g. "<output_file>_tree.nwk",
-    # "<output_file>_internal_ancestral_reconstruction.fas"); it does not
-    # insert an "_ASR" infix. Verified against a real run of external/indelMaP.
-    tree_file = r2 / "indelmap_asr" / f"{gene}.indelmap_tree.nwk"
-    fasta_file = r2 / "indelmap_asr" / f"{gene}.indelmap_internal_ancestral_reconstruction.fas"
-    status_file = out / f"03_{gene}.indelmap_concordance_status.tsv"
-    concord_file = out / f"03_{gene}.indelmap_concordance.tsv"
-    header = ["gene", "character_id", "pensieve_node_label", "indelmap_node_label", "pensieve_state", "indelmap_state", "agreement"]
-    if not tree_file.exists() or not fasta_file.exists() or tree_file.stat().st_size == 0 or fasta_file.stat().st_size == 0:
-        write_tsv([{"gene": gene, "status": "not_available", "details": "IndelMaP disabled, failed, or did not emit expected ancestral files"}], status_file)
-        write_tsv([], concord_file, header)
-        return
-
-    indel_tree = normalise_tree_tip_names(Phylo.read(str(tree_file), "newick"))
-    validate_same_unrooted_topology(pensieve_tree, indel_tree, "IndelMaP tree")
-    pens_index, pens_labels = rooted_internal_index(pensieve_tree, "Pensieve tree", require_labels=True)
-    indel_index, indel_labels = rooted_internal_index(indel_tree, "IndelMaP tree", require_labels=True)
-    if set(pens_index) != set(indel_index):
-        write_tsv([{"gene": gene, "status": "rooted_topology_disagreement", "details": "IndelMaP rooted descendant sets differ from Pensieve tree"}], status_file)
-        write_tsv([], concord_file, header)
-        return
-
-    indel_sequences, _ = read_fasta(fasta_file)
-    characters = {r["character_id"]: r for r in read_tsv(out / f"03_{gene}.alignment_characters.tsv") if r.get("character_class") == "indel"}
-    pstate = {(r["character_id"], r["node_label"]): r.get("state", "unknown") for r in read_tsv(out / f"03_{gene}.alignment_character_node_states.tsv")}
-    rows = []
-    for key in sorted(pens_index):
-        plabel = pens_labels[key]
-        ilabel = indel_labels[key]
-        seq = indel_sequences.get(ilabel)
-        if seq is None:
-            continue
-        for cid, char in characters.items():
-            start = safe_int(char.get("alignment_start")); end = safe_int(char.get("alignment_end"))
-            if start is None or end is None or end > len(seq):
-                istate = "unknown"
-            else:
-                segment = seq[start - 1:end].upper()
-                if segment and all(c == "-" for c in segment):
-                    istate = "gap"
-                elif segment and all(c in "ACGTN" for c in segment) and any(c in "ACGT" for c in segment):
-                    istate = "residue"
-                else:
-                    istate = "unknown"
-            ps = pstate.get((cid, plabel), "unknown")
-            comparable = ps in {"gap", "residue"} and istate in {"gap", "residue"}
-            rows.append({
-                "gene": gene, "character_id": cid, "pensieve_node_label": plabel,
-                "indelmap_node_label": ilabel, "pensieve_state": ps, "indelmap_state": istate,
-                "agreement": (ps == istate) if comparable else "NA",
-            })
-    write_tsv(rows, concord_file, header)
-    comparable = [r for r in rows if r["agreement"] != "NA"]
-    disagree = [r for r in comparable if not trueish(r["agreement"])]
-    write_tsv([{
-        "gene": gene, "status": "available", "n_comparable_states": len(comparable),
-        "n_disagreements": len(disagree), "details": "IndelMaP is concordance evidence only; it never overwrites Pensieve states",
-    }], status_file)
-
-
-# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Parse codeml marginal ASR and map PAML internodes to Pensieve nodes.")
@@ -748,7 +679,6 @@ def main():
         "status": "PASS",
     }], out / f"03_{gene}.tree_topology_and_node_count_audit.tsv")
 
-    indelmap_concordance(gene, r2, out, pensieve_tree)
     warning_lines = [
         "PAML marginal-ASR completeness was validated from its own 'Nodes X to Y are ancestral' declaration.",
         "The biological dated root is not assigned the clock=0 PAML Newick serialization/root sequence; root ORF status remains unavailable.",

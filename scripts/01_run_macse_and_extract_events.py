@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, csv, subprocess, sys
+import argparse, csv, difflib, subprocess, sys
 from collections import Counter
 from pathlib import Path
 from Bio import Phylo, SeqIO
@@ -77,15 +77,54 @@ def species_raw_pos_at(seq, aln_start, aln_end):
     return left + 1, left + within
 
 
-def map_raw_nt_to_aln(seq, raw_nt):
-    count = 0
-    for i, c in enumerate(seq, start=1):
-        if c in "-!":
+def build_raw_to_alignment_map(seq, raw_seq):
+    """Build a full 1-based-raw-position -> 1-based-alignment-column map for
+    one species' own row, once, for repeated lookup (see map_raw_nt_to_aln).
+
+    MACSE never deletes or reorders a real input character, but it can
+    insert synthetic characters that are not present in the raw input at
+    all, in more than one place in the same row -- not only its own
+    documented '!' partial-codon marker, but (confirmed on real data:
+    GUCA1C/Desmodus_rotundus) occasionally a literal ambiguity code like
+    'N' standing in for a position it could not resolve, with no '!'
+    involved, and sometimes more than once in the same row. A naive
+    single-pass greedy character-by-character match (skip on mismatch,
+    otherwise advance) breaks down as soon as there is more than one such
+    insertion: a mismatch at the first one is handled correctly, but if the
+    very next real raw character coincidentally does not equal whatever
+    comes next in seq (extremely likely once there is a second, unrelated
+    insertion later in the row), the greedy scan has no way to recover --
+    it can stall indefinitely with no further matches, or silently latch
+    onto the wrong character. This showed up on real data: with a second,
+    independent MACSE insertion further into the same gene, greedy matching
+    for Desmodus_rotundus stalled partway through GUCA1C and never found a
+    STOP coordinate mapping in the back half of the gene at all.
+
+    A proper sequence alignment (difflib's longest-matching-block algorithm)
+    between the species' own raw sequence and the non-gap characters of its
+    aligned row does not have this failure mode: every 'equal' opcode block
+    is, by construction, a genuine, correctly-ordered run of real raw
+    characters, however many separate synthetic insertions sit between them.
+    """
+    non_gap_positions = [i for i, c in enumerate(seq) if c != "-"]
+    non_gap_chars = "".join(seq[i] for i in non_gap_positions)
+    sm = difflib.SequenceMatcher(None, raw_seq.upper(), non_gap_chars.upper(), autojunk=False)
+    mapping = {}
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag != "equal":
             continue
-        count += 1
-        if count == raw_nt:
-            return i
-    return None
+        for k in range(i2 - i1):
+            mapping[i1 + k + 1] = non_gap_positions[j1 + k] + 1
+    return mapping
+
+
+def map_raw_nt_to_aln(seq, raw_nt, raw_seq):
+    """Map a single 1-based raw position to its 1-based alignment column.
+    Convenience wrapper around build_raw_to_alignment_map() for one-off
+    lookups; prefer building the map once and reusing it for many lookups
+    against the same (seq, raw_seq) pair.
+    """
+    return build_raw_to_alignment_map(seq, raw_seq).get(raw_nt)
 
 
 STANDARD_CODON_TABLE = {
@@ -245,12 +284,18 @@ def resolve_conserved_block(raw, nt_macse0, status_by, block_codons):
         macse_seq = nt_macse0.get(name)
         if macse_seq is None or len(raw_seq) < block_nt:
             continue
-        aln_col_end = map_raw_nt_to_aln(macse_seq, block_nt)
+        aln_col_end = map_raw_nt_to_aln(macse_seq, block_nt, raw_seq)
         if aln_col_end is None:
             continue
         block_region = macse_seq[:aln_col_end]
-        if "!" not in block_region and "-" not in block_region:
-            continue  # MACSE made no modification in the block for this species
+        if len(block_region) == block_nt:
+            # block_region is guaranteed to contain exactly block_nt real raw
+            # characters by construction of aln_col_end; any gap or synthetic
+            # insertion (whatever character MACSE renders it as -- '!', a raw
+            # ambiguity code, or otherwise) makes it longer. Equal length
+            # means nothing at all differs here for this species, not even
+            # padding from another species' own insertion elsewhere.
+            continue
         candidate_raw = raw_seq[:block_nt]
         candidate_macse = block_region.replace("!", "N").replace("-", "")
         raw_nt_score, raw_aa_score = block_quality_scores(candidate_raw, ref)
@@ -276,29 +321,43 @@ def realign_block_content(block_content, macse_cmd, tool_cwd, log_file):
 
     Only when an ACCEPTED MACSE edit genuinely changed a species' block
     length (a real indel inside the conserved block, or its own count of
-    MACSE '!' frame-restoration characters folded into that length) does
-    this need to actually realign. Pensieve v4.2 uses MACSE itself for this
-    -- the single alignment engine everywhere in the pipeline, never a
-    second tool -- instead of the earlier approach of translating to
-    protein and aligning with a separate amino-acid aligner. MACSE aligns
-    raw nucleotide block candidates directly and is frame-aware by
-    construction, so it does not have the earlier bug (found running real
-    CNGA3 data) of producing a block width not divisible by 3 when
-    candidates differ in length. Each candidate is first trimmed to its own largest multiple of
-    3 (an accepted MACSE block edit is already codon-respecting, so this
-    can only discard 1-2 trailing nucleotides of an already-provisional
-    block candidate, never real, already-accepted sequence content).
+    MACSE '!'/synthetic-ambiguity-code frame-restoration characters folded
+    into that length) does this need to actually realign. Pensieve v4.2
+    uses MACSE itself for this -- the single alignment engine everywhere in
+    the pipeline, never a second tool -- instead of the earlier approach of
+    translating to protein and aligning with a separate amino-acid aligner.
+    MACSE aligns raw nucleotide block candidates directly and is frame-aware
+    by construction, so it does not have the earlier bug (found running
+    real CNGA3 data) of producing a block width not divisible by 3 when
+    candidates differ in length.
+
+    Candidates are NOT pre-trimmed to a multiple of 3 before this call.
+    MACSE's entire purpose is aligning coding sequences that are not
+    already codon-multiple in length (that is what its own '!' placeholder
+    mechanism is for) -- it does not need or expect codon-multiple input.
+    An earlier version of this function DID trim non-codon-multiple
+    candidates before calling MACSE, inherited unmodified from an earlier
+    implementation that translated candidates to protein before aligning
+    them, where trimming was genuinely required (translate_codon_seq
+    silently drops a trailing partial codon on translation but not on
+    back-translation, desynchronising the two). That requirement does not
+    apply here at all, since this function never translates anything --
+    and real GUCA1C/Desmodus_rotundus data proved
+    the trim itself was actively harmful: a candidate can legitimately
+    contain a masked 'N' (standing in for one of MACSE's own inferred
+    positions) anywhere within it, not just trailing, so trimming from the
+    end to force a codon-multiple length could -- and did -- discard a
+    real, already-accepted raw nucleotide instead of a synthetic one.
     """
     lengths = {len(seq) for seq in block_content.values()}
     if len(lengths) == 1:
         return dict(block_content)
-    trimmed = {name: seq[:len(seq) - len(seq) % 3] for name, seq in block_content.items()}
 
     tool_cwd = Path(tool_cwd); tool_cwd.mkdir(parents=True, exist_ok=True)
     macse_in = tool_cwd / "block_input.fasta"
     nt_out = tool_cwd / "block_aligned_NT.fasta"
     aa_out = tool_cwd / "block_aligned_AA.fasta"
-    write_fasta(trimmed, macse_in, list(trimmed.keys()))
+    write_fasta(block_content, macse_in, list(block_content.keys()))
     cmd = [macse_cmd, "-prog", "alignSequences", "-seq", str(macse_in.resolve()),
            "-out_NT", str(nt_out.resolve()), "-out_AA", str(aa_out.resolve())]
     run_external(cmd, tool_cwd, log_file)
@@ -486,6 +545,7 @@ def main():
     # or reference-coordinate projection is involved.
     failures = read_tsv(step00 / f"00_{gene}.orf_failures.tsv")
     pm = []
+    raw_to_aln_by_species = {}
     for r in failures:
         if r.get("failure_type") != "premature_in_frame_stop":
             continue
@@ -493,9 +553,12 @@ def main():
         seq = nt.get(sp)
         if not seq:
             continue
+        if sp not in raw_to_aln_by_species:
+            raw_to_aln_by_species[sp] = build_raw_to_alignment_map(seq, raw[sp])
+        raw_to_aln = raw_to_aln_by_species[sp]
         nt_start = int(float(r["nt_start"]))
         nt_end = int(float(r["nt_end"]))
-        cols = [map_raw_nt_to_aln(seq, x) for x in range(nt_start, nt_end + 1)]
+        cols = [raw_to_aln.get(x) for x in range(nt_start, nt_end + 1)]
         if any(c is None for c in cols):
             raise SystemExit(
                 f"Could not map raw premature STOP coordinates for {sp}: {nt_start}-{nt_end} into {nt_out}"
