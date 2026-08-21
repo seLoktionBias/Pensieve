@@ -9,7 +9,7 @@ ALIGNMENT="perform"; DATED="yes"; RUN_FROM_STEP="AUTO"; RUN_UP_TO="FULL"
 CLEAN=0; SKIP_PLOT=0; PAML_MODE="local"; DAT_DIR="$PROGRAM_DIR/dat"; ENV_NAME="Pensieve"
 TIE_BREAK="none"; BREAKPOINT_TOLERANCE="0"; ON_MISSING_ROOT_SEQUENCE="warn"
 ORF_LOSS_COST="1.0"; ORF_RESTORATION_COST="2.0"; PSEUDOGENIC_BOUNDARY_CAP_VOTES="2.0"
-MIN_FUNCTIONAL_WITNESSES="2"
+MIN_FUNCTIONAL_WITNESSES="2"; ON_COMPLETE_ORF_VIOLATION="warn"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -29,6 +29,7 @@ while [[ $# -gt 0 ]]; do
     --dat-dir) DAT_DIR="$2"; shift 2;;
     --indelmap|--indelmap-dir) shift 2;;   # removed; accepted and ignored for back-compat
     --min-functional-witnesses) MIN_FUNCTIONAL_WITNESSES="$2"; shift 2;;
+    --on-complete-orf-violation) ON_COMPLETE_ORF_VIOLATION="$2"; shift 2;;
     --env-name) ENV_NAME="$2"; shift 2;;
     --tie-break) TIE_BREAK="$2"; shift 2;;
     --breakpoint-tolerance) BREAKPOINT_TOLERANCE="$2"; shift 2;;
@@ -45,6 +46,7 @@ done
 case "$ALIGNMENT" in perform|defined) ;; *) echo "[ERROR] --alignment perform|defined" >&2; exit 1;; esac
 case "$DATED" in yes|no) ;; *) echo "[ERROR] --dated yes|no" >&2; exit 1;; esac
 case "$TIE_BREAK" in none|ancestral|terminal) ;; *) echo "[ERROR] --tie-break none|ancestral|terminal" >&2; exit 1;; esac
+case "$ON_COMPLETE_ORF_VIOLATION" in stop|warn) ;; *) echo "[ERROR] --on-complete-orf-violation stop|warn" >&2; exit 1;; esac
 case "$PAML_MODE" in
   local|same) ;;
   slurm) echo "[WARN] nested --paml-mode slurm is deprecated; running codeml in the current allocation" >&2; PAML_MODE="local";;
@@ -60,6 +62,11 @@ trap 'status=$?; if [[ $status -ne 0 ]]; then echo "[ERROR] Pensieve failed whil
 trap 'echo "[ERROR] Failed at line $LINENO while processing ${GENE:-unknown}" >&2' ERR
 
 require_file(){ [[ -s "$1" ]] || { echo "[ERROR] Missing or empty required file ($2): $1" >&2; exit 1; }; }
+# Some required files are legitimately EMPTY: 00_<gene>.complete_seqs.fa when no
+# sequence in the gene has a complete ORF, and 00_<gene>.incomplete_seqs.fa when
+# every sequence does. Step 00 always writes both, so presence -- not size -- is
+# the real prerequisite.
+require_file_exists(){ [[ -f "$1" ]] || { echo "[ERROR] Missing required file ($2): $1" >&2; exit 1; }; }
 copy_if_exists(){ local s="$1" d="$2"; [[ -s "$s" ]] && cp -f "$s" "$d" || true; }
 
 normalise_step(){
@@ -100,9 +107,8 @@ require_diagnostics(){
   require_file "results_00/$GENE/00_${GENE}.orf_status.tsv" step00_orf_status
   # --alignment defined does not run MACSE at all, so its NT alignment is not a
   # prerequisite; the supplied codon alignment is used directly in step 02.
-  require_file "results_00/$GENE/00_${GENE}.complete_seqs.fa" step00_complete_seqs
-  # 00_<gene>.incomplete_seqs.fa is intentionally NOT required: a gene in which
-  # every sequence has a complete ORF legitimately produces an empty one.
+  require_file_exists "results_00/$GENE/00_${GENE}.complete_seqs.fa" step00_complete_seqs
+  require_file_exists "results_00/$GENE/00_${GENE}.incomplete_seqs.fa" step00_incomplete_seqs
   if [[ "$ALIGNMENT" == "perform" ]]; then
     require_file "results_01/$GENE/01_${GENE}.macse_NT.fasta" step01_macse_nt
   fi
@@ -200,7 +206,7 @@ mkdir -p "results_00/$GENE" "results_01/$GENE" "results_02/$GENE" "results_03/$G
 
 echo "============================================================"
 echo "Pensieve $(cat "$PROGRAM_DIR/VERSION") | GENE=$GENE | alignment=$ALIGNMENT | dated=$DATED"
-echo "range=$RUN_FROM_STEP->$RUN_UP_TO | tie_break=$TIE_BREAK | min_functional_witnesses=$MIN_FUNCTIONAL_WITNESSES"
+echo "range=$RUN_FROM_STEP->$RUN_UP_TO | tie_break=$TIE_BREAK | min_functional_witnesses=$MIN_FUNCTIONAL_WITNESSES | on_complete_orf_violation=$ON_COMPLETE_ORF_VIOLATION"
 echo "workdir=$WORKDIR | start=$(date)"
 echo "============================================================"
 
@@ -232,7 +238,7 @@ elif prereq_needed diagnostics; then require_diagnostics; fi
 if step_in_range alignment; then
   require_diagnostics
   echo "[$(date)] STEP alignment: build one canonical alignment + synchronized PAML-safe view"
-  python "$SCRIPT_DIR/02_prepare_asr_inputs.py" --gene "$GENE" --results01-dir "results_01/$GENE" --results00-dir "results_00/$GENE" --outdir "results_02/$GENE" --alignment-mode "$ALIGNMENT"
+  python "$SCRIPT_DIR/02_prepare_asr_inputs.py" --gene "$GENE" --results01-dir "results_01/$GENE" --results00-dir "results_00/$GENE" --outdir "results_02/$GENE" --alignment-mode "$ALIGNMENT" --on-complete-orf-violation "$ON_COMPLETE_ORF_VIOLATION"
 elif prereq_needed alignment; then require_alignment; fi
 
 if step_in_range events; then
@@ -287,6 +293,7 @@ if step_in_range plot; then
       --events "results_03/$GENE/03_${GENE}.alignment_events.tsv" \
       --orf-transitions "results_03/$GENE/04_${GENE}.orf_transitions_by_branch.tsv" \
       --orf-status "results_00/$GENE/00_${GENE}.orf_status.tsv" \
+      --complete-orf-validation "results_02/$GENE/02_${GENE}.complete_orf_alignment_validation.tsv" \
       --alignment-length "$ALN_LEN" \
       --outdir "final_results/$GENE/important_output" --dated "$DATED"
     require_file "final_results/$GENE/important_output/${GENE}.pseudogenization_tree.pdf" plot_pdf

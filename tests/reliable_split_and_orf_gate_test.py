@@ -214,7 +214,8 @@ with tempfile.TemporaryDirectory() as d:
     def expect_fail(label, native, source, reason_fragment):
         try:
             prep.validate_complete_orf_alignment(
-                "T", source, native, order, ["A", "B"], inputs, out, "test")
+                "T", source, native, order, ["A", "B"], inputs, out, "test",
+                on_violation="stop")
         except SystemExit as exc:
             report = out / "02_T.complete_orf_alignment_validation.tsv"
             reasons = " ".join(r["failure_reason"] for r in tsv(report))
@@ -233,7 +234,8 @@ with tempfile.TemporaryDirectory() as d:
     nat = {k: v.replace("!", "-") for k, v in src.items()}
     inputs2 = dict(inputs); inputs2["A"] = "ATGAAACCCGG"
     try:
-        prep.validate_complete_orf_alignment("T", src, nat, order, ["A", "B"], inputs2, out, "test")
+        prep.validate_complete_orf_alignment("T", src, nat, order, ["A", "B"], inputs2, out, "test",
+                                             on_violation="stop")
         check(False, "frameshift marker: should have stopped the pipeline, but did not")
     except SystemExit:
         reasons = " ".join(r["failure_reason"] for r in tsv(out / "02_T.complete_orf_alignment_validation.tsv"))
@@ -247,6 +249,32 @@ with tempfile.TemporaryDirectory() as d:
     # The report survives a failure -- that is the point of it.
     check((out / "02_T.complete_orf_alignment_validation.tsv").exists(),
           "the diagnostic report is on disk after a failure")
+
+# ---------------------------------------------------------------- warn vs stop
+print("--on-complete-orf-violation: warn continues and flags, stop aborts")
+with tempfile.TemporaryDirectory() as d:
+    out = Path(d)
+    inputs = {"A": "ATGAAACCCGGG", "B": "ATGAAACCC", "C": "ATGAAACCCGGG"}
+    order = ["A", "B", "C"]
+    # A's aligned row splits a codon across a gap boundary.
+    bad = {"A": "ATGAAACC-CGGG", "B": "ATGAAACCC----", "C": "ATGAAACCCGGG-"}
+
+    rows = prep.validate_complete_orf_alignment(
+        "T", dict(bad), bad, order, ["A", "B"], inputs, out, "test", on_violation="warn")
+    check(rows is not None, "warn returns instead of raising: the batch continues")
+    verdicts = {r["species"]: r["verdict"] for r in rows}
+    check(verdicts.get("A") == "FAIL",
+          f"the offending species is still recorded FAIL under warn (got {verdicts})")
+    check((out / "02_T.complete_orf_alignment_validation.tsv").exists(),
+          "the diagnostic report is written under warn as well")
+
+    try:
+        prep.validate_complete_orf_alignment(
+            "T", dict(bad), bad, order, ["A", "B"], inputs, out, "test", on_violation="stop")
+        check(False, "stop should have aborted, but did not")
+    except SystemExit as exc:
+        check("--on-complete-orf-violation stop" in str(exc),
+              "stop names the flag that caused the abort")
 
 if FAILURES:
     print(f"\n{len(FAILURES)} failure(s):")

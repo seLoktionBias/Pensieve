@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import csv
 import difflib
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -470,7 +471,7 @@ COMPLETE_ORF_VALIDATION_HEADER = [
 
 
 def validate_complete_orf_alignment(gene, canonical_source, native, order, complete_species,
-                                    input_seqs, out, coordinate_system):
+                                    input_seqs, out, coordinate_system, on_violation="warn"):
     """Hard gate, run before anything is handed to PAML: a complete ORF must
     come out of alignment still intact.
 
@@ -494,10 +495,17 @@ def validate_complete_orf_alignment(gene, canonical_source, native, order, compl
          codon frame that PAML, the STOP scan and the ORF walk all assume is
          not actually there.
 
-    Any violation aborts before PAML and leaves
-    `02_<gene>.complete_orf_alignment_validation.tsv` behind as the diagnostic
-    report. The report is written on success too, so a clean run is auditable
-    rather than merely silent.
+    `on_violation` decides what a violation costs:
+
+      * `"warn"` (default) -- report it loudly, flag the species, and carry on.
+        One bad row in one gene must not abandon a whole batch; the affected
+        species are marked with a trailing `*` on both figures so the reader can
+        see at a glance which reading frames were not verifiable.
+      * `"stop"` -- abort before PAML. Use when a corrupted reading frame must
+        never reach the ancestral reconstruction unnoticed.
+
+    Either way `02_<gene>.complete_orf_alignment_validation.tsv` is written, on a
+    clean run too, so the result is auditable rather than merely silent.
     """
     rows = []
     failures = []
@@ -552,16 +560,23 @@ def validate_complete_orf_alignment(gene, canonical_source, native, order, compl
         detail = "\n".join(
             f"    {r['species']}: {r['failure_reason']}" for r in failures[:20])
         more = f"\n    ... and {len(failures) - 20} more" if len(failures) > 20 else ""
-        raise SystemExit(
-            f"[ERROR] {gene}: {len(failures)} of {n_complete} complete-ORF sequence(s) did not survive "
-            f"alignment intact. Pensieve stops here rather than handing a corrupted reading frame to "
-            f"PAML.\n{detail}{more}\n"
-            f"    Diagnostic report: {report}\n"
-            f"    Coordinate system: {coordinate_system}"
-        )
-    print(f"Complete-ORF alignment validation for {gene}: {n_complete}/{n_complete} complete ORFs "
-          f"reproduce their input exactly, carry no frameshift markers, and sit on whole codon cells "
-          f"({report.name})")
+        headline = (f"{gene}: {len(failures)} of {n_complete} complete-ORF sequence(s) did not survive "
+                    f"alignment intact")
+        if on_violation == "stop":
+            raise SystemExit(
+                f"[ERROR] {headline}. Pensieve stops here rather than handing a corrupted reading "
+                f"frame to PAML (--on-complete-orf-violation stop).\n{detail}{more}\n"
+                f"    Diagnostic report: {report}\n"
+                f"    Coordinate system: {coordinate_system}"
+            )
+        print(f"[WARN] {headline}. Continuing (--on-complete-orf-violation warn); these species are "
+              f"marked with a trailing '*' on both figures and their reading frame downstream is "
+              f"NOT verified.\n{detail}{more}\n"
+              f"    Diagnostic report: {report}", file=sys.stderr)
+    else:
+        print(f"Complete-ORF alignment validation for {gene}: {n_complete}/{n_complete} complete ORFs "
+              f"reproduce their input exactly, carry no frameshift markers, and sit on whole codon cells "
+              f"({report.name})")
     return rows
 
 
@@ -572,6 +587,13 @@ def main() -> None:
     parser.add_argument("--results00-dir", required=True)
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--alignment-mode", choices=["perform", "defined"], default="perform")
+    parser.add_argument("--on-complete-orf-violation", choices=["stop", "warn"], default="warn",
+                        help="What to do when a complete-ORF sequence does not survive alignment intact "
+                             "(see validate_complete_orf_alignment). 'warn' (default) reports it, flags "
+                             "the species with a trailing '*' on both figures, and continues -- one bad "
+                             "row must not abandon a whole batch. 'stop' aborts before PAML. The "
+                             "diagnostic report 02_<gene>.complete_orf_alignment_validation.tsv is "
+                             "written either way.")
     args = parser.parse_args()
 
     gene = args.gene
@@ -632,7 +654,8 @@ def main() -> None:
     input_raw, _input_order = read_fasta(input_path)
     input_seqs = {name: seq.replace("-", "") for name, seq in input_raw.items()}
     validate_complete_orf_alignment(gene, canonical_source, native, order, complete_species,
-                                    input_seqs, out, coordinate_system)
+                                    input_seqs, out, coordinate_system,
+                                    on_violation=args.on_complete_orf_violation)
 
     if args.alignment_mode == "perform":
         # MACSE ran: join raw STOP calls to MACSE frame-phase diagnostics and

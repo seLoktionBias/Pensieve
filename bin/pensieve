@@ -169,6 +169,10 @@ def print_short_help():
                                >=N independent complete-ORF lineages sharing an indel
                                fix it as ancestral, provided it is also the
                                functional consensus (default 2; 0 disables)
+      --on-complete-orf-violation stop|warn
+                               what to do when a complete ORF does not survive
+                               alignment intact (default warn: mark the species
+                               with * on the figures and continue)
       --tie-break none|ancestral|terminal
       --run_from_step STEP     diagnostics|alignment|events|asr|integrate|plot
       --run_up_to STEP         diagnostics|alignment|events|asr|integrate|plot
@@ -184,7 +188,7 @@ def print_short_help():
 def print_long_help():
     print(textwrap.dedent("""\
     ===========================================================================
-    Pensieve v4.8 - full manual
+    Pensieve v4.9 - full manual
     ===========================================================================
 
     PURPOSE
@@ -421,6 +425,24 @@ def print_long_help():
           default 0. Keep 0 unless manual inspection demonstrates a small
           alignment offset that should be clustered.
 
+      --on-complete-orf-violation stop|warn
+          default warn. A sequence that entered step 00 with a complete ORF
+          describes a real, unbroken reading frame, so alignment may only put
+          gaps around it. Before anything reaches PAML, step 02 requires every
+          complete ORF to (1) reproduce its input sequence exactly after
+          degapping, (2) carry zero MACSE '!' markers, and (3) occupy only
+          whole codon cells -- three residues or '---', never a mixed cell.
+
+          warn: report the violation, mark those species with a trailing '*'
+          on both figures, and continue. One unverifiable row must not abandon
+          a whole batch; the '*' tells the reader which reading frames were
+          not verified.
+          stop: abort before PAML instead.
+
+          Either way the per-species diagnostic report
+          02_<gene>.complete_orf_alignment_validation.tsv is written, and
+          incomplete-ORF sequences are reported but never gate the run.
+
       --min-functional-witnesses N
           default 2. Threshold for the functional-shared ancestral-indel rule,
           evaluated by the diagnostics-stage pre-pass
@@ -538,6 +560,7 @@ def build_parser():
     parser.add_argument("--tie-break", choices=["none", "ancestral", "terminal"], default="none")
     parser.add_argument("--breakpoint-tolerance", type=int, default=0)
     parser.add_argument("--min-functional-witnesses", type=int, default=2)
+    parser.add_argument("--on-complete-orf-violation", choices=["stop", "warn"], default="warn")
     parser.add_argument("--run_from_step", "--run-from-step", default="AUTO")
     parser.add_argument("--run_up_to", "--run-up-to", default="FULL")
     parser.add_argument("--clean", action="store_true")
@@ -653,6 +676,7 @@ def main():
         "--tie-break", args.tie_break,
         "--breakpoint-tolerance", str(args.breakpoint_tolerance),
         "--min-functional-witnesses", str(args.min_functional_witnesses),
+        "--on-complete-orf-violation", args.on_complete_orf_violation,
     ]
     if args.clean:
         base_cmd.append("--clean")

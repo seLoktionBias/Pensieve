@@ -41,6 +41,7 @@ tree_file  <- get_arg("--tree")
 events_file<- get_arg("--events")
 orf_file   <- get_arg("--orf-transitions", NA_character_)
 orf_status_file <- get_arg("--orf-status", NA_character_)
+corf_file  <- get_arg("--complete-orf-validation", NA_character_)
 outdir     <- get_arg("--outdir", ".")
 dated      <- is_yes(get_arg("--dated", "yes"))
 aln_len_arg<- get_arg("--alignment-length", NA_character_)
@@ -59,6 +60,7 @@ tipfont_arg<- get_arg("--tip-font", "auto")
 # a bad flag name fails loudly here instead of silently producing a wrong,
 # uniformly grey plot.
 known_flags <- c("--gene", "--tree", "--events", "--orf-transitions", "--orf-status",
+                 "--complete-orf-validation",
                   "--outdir", "--dated", "--alignment-length", "--min-sites", "--show-tips",
                   "--width", "--height", "--tip-font")
 flag_positions <- grep("^--", args)
@@ -74,6 +76,8 @@ if (!is.na(orf_file) && !file.exists(orf_file))
   stop("--orf-transitions file not found: ", orf_file)
 if (!is.na(orf_status_file) && !file.exists(orf_status_file))
   stop("--orf-status file not found: ", orf_status_file)
+if (!is.na(corf_file) && !file.exists(corf_file))
+  stop("--complete-orf-validation file not found: ", corf_file)
 dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
 
 read_tsv_base <- function(path) {
@@ -215,6 +219,18 @@ orf_status <- read_tsv_base(orf_status_file)
 if (nrow(orf_status) > 0 && all(c("species", "starts_with_atg") %in% names(orf_status)))
   no_start_tips <- orf_status$species[!to_bool(orf_status$starts_with_atg)]
 
+# ------------------------------------------- unverified complete-ORF alignment
+# A species whose CDS entered the run with a complete ORF but whose aligned row
+# did not survive alignment intact (step 02's pre-PAML gate: degapped row must
+# reproduce the input exactly, no MACSE '!' marker, whole codon cells only).
+# Under --on-complete-orf-violation warn the run continues, so the reader must
+# be able to see which reading frames were NOT verified: those species get a
+# trailing '*' on their tip label on BOTH figures. Absent file => no marks.
+unverified_tips <- character(0)
+corf <- read_tsv_base(corf_file)
+if (nrow(corf) > 0 && all(c("species", "verdict") %in% names(corf)))
+  unverified_tips <- corf$species[corf$verdict == "FAIL"]
+
 # ---------------------------------------------------------------- sizing
 max_chars <- if (show_tips) max(nchar(gsub("_", " ", tr$tip.label))) else 0
 tip_font <- if (tipfont_arg == "auto") max(1.2, min(3.2, 320 / max(ntip, 1))) else as.numeric(tipfont_arg)
@@ -328,6 +344,10 @@ subtitle <- paste0(nrow(ev), " events on ", length(unique(ev$branch)), " branche
                                                         " with an exact parsimony tie") else "",
                    if (length(no_start_tips) > 0)
                      paste0("; red X at tip = no ATG start codon (", length(no_start_tips), ")")
+                   else "",
+                   if (length(unverified_tips) > 0)
+                     paste0("; * after a name = complete ORF whose aligned reading frame could not be "
+                            , "verified (", length(unverified_tips), ")")
                    else "")
 
 base_tree <- function(p) {
@@ -341,6 +361,9 @@ base_tree <- function(p) {
 
 tip_df <- coord[coord$isTip, , drop = FALSE]
 tip_df$plot_label <- gsub("_", " ", tip_df$label)
+# Single place the displayed tip label is built, so the '*' reaches both figures.
+tip_df$plot_label <- ifelse(tip_df$label %in% unverified_tips,
+                            paste0(tip_df$plot_label, " *"), tip_df$plot_label)
 tip_df$no_start <- tip_df$label %in% no_start_tips
 # A species NAME is red/bold exactly when its own branch renders as
 # pseudogenized (the same collapsed orf_class driving branch colour above),

@@ -69,7 +69,7 @@ def write_table(path, header, rows):
 
 def test_static_and_cli():
     print("static architecture and CLI")
-    check((ROOT / "VERSION").read_text().strip() == "4.8", "VERSION is 4.8")
+    check((ROOT / "VERSION").read_text().strip() == "4.9", "VERSION is 4.9")
     ctl = (ROOT / "templates" / "dummy_codon_asr.ctl").read_text()
     for token, msg in [
         ("clock = 0", "codeml clock=0"),
@@ -107,7 +107,7 @@ def test_static_and_cli():
         check(r.returncode == 0 and "Pensieve" in r.stdout, f"help form {' '.join(args)} works")
     long_help = subprocess.run([sys.executable, str(ROOT / "bin" / "pensieve"), "--help", "-long"],
                                capture_output=True, text=True).stdout
-    check("Pensieve v4.8 - full manual" in long_help, "long help reports v4.8")
+    check("Pensieve v4.9 - full manual" in long_help, "long help reports v4.9")
     check("diagnostics < alignment < events < asr < integrate < plot" in long_help,
           "long help documents actual stage order")
 

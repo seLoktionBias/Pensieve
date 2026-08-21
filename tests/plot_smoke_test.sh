@@ -41,4 +41,31 @@ Rscript "$ROOT/scripts/05_plot_events.R" \
 [[ -s "$tmp/out/T.pseudogenization_tree.pdf" && -s "$tmp/out/T.event_map.pdf" ]] || {
   echo "Undated plot smoke output missing" >&2; exit 1;
 }
-echo "Plot smoke test passed (dated + undated)."
+# Unverified complete ORFs (--on-complete-orf-violation warn) must be MARKED, not
+# dropped: the species keeps its tip label and gains a trailing '*', both figures
+# are still produced, and the subtitle says how many are flagged.
+cat > "$tmp/corf.tsv" <<'EOF'
+gene	species	complete_orf	verdict	failure_reason
+T	A	True	FAIL	2_incomplete_codon_cell(s)
+T	B	True	pass	NA
+T	C	False	not_applicable	NA
+T	D	False	not_applicable	NA
+EOF
+rm -f "$tmp/out"/T.*
+Rscript "$ROOT/scripts/05_plot_events.R" \
+  --gene T --tree "$tmp/tree.nwk" --events "$tmp/events.tsv" \
+  --orf-transitions "$tmp/orf.tsv" --complete-orf-validation "$tmp/corf.tsv" \
+  --alignment-length 120 --outdir "$tmp/out" --dated no >/dev/null
+for f in T.pseudogenization_tree.pdf T.event_map.pdf; do
+  [[ -s "$tmp/out/$f" ]] || { echo "Missing plot output with --complete-orf-validation: $f" >&2; exit 1; }
+done
+# A missing/omitted validation file must stay a no-op, never an error.
+rm -f "$tmp/out"/T.*
+Rscript "$ROOT/scripts/05_plot_events.R" \
+  --gene T --tree "$tmp/tree.nwk" --events "$tmp/events.tsv" \
+  --orf-transitions "$tmp/orf.tsv" \
+  --alignment-length 120 --outdir "$tmp/out" --dated no >/dev/null
+[[ -s "$tmp/out/T.pseudogenization_tree.pdf" ]] || {
+  echo "Omitting --complete-orf-validation broke the plot" >&2; exit 1; }
+
+echo "Plot smoke test passed (dated + undated + unverified-ORF marking)."

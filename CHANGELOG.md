@@ -1,5 +1,32 @@
 # Changelog
 
+## v4.9 - the complete-ORF gate warns by default and marks the species on the figures; no-complete-ORF genes no longer crash
+
+Requested directly, after v4.8 landed.
+
+### `--on-complete-orf-violation stop|warn` (default `warn`)
+- v4.8's pre-PAML complete-ORF gate always aborted. That is right when a corrupted reading frame must never reach the ancestral reconstruction unnoticed, but wrong for a batch over many genes: one unverifiable row abandoned the whole run.
+- New flag on `bin/pensieve`, the runner and `02_prepare_asr_inputs.py`. `warn` (the new default) reports the violation with a per-species reason, writes the same `02_<gene>.complete_orf_alignment_validation.tsv`, and **continues**. `stop` keeps v4.8's abort-before-PAML behaviour.
+
+### Violating species are MARKED on both figures
+- `05_plot_events.R` gains `--complete-orf-validation`. Any species whose verdict is `FAIL` keeps its tip label and gains a trailing `*` on the pseudogenization tree *and* the event map (the marker is applied at the single place the displayed label is built, so the two figures can never disagree). The subtitle records the count: `* after a name = complete ORF whose aligned reading frame could not be verified (N)`.
+- Nothing is hidden or removed — the species is still drawn, still coloured by its own ORF history, still carries its event ticks. The `*` says "this reading frame was not verified", nothing more. An absent or omitted `--complete-orf-validation` file is a silent no-op, never an error.
+- The runner passes the report to the plot automatically, so the marks appear in a normal end-to-end run with no extra flags.
+
+### Real bug: a gene with no complete ORF crashed the runner
+- Reported directly. v4.8 promised a fallback to the default MACSE command when no sequence in a gene has a complete ORF, and step 01 did exactly that — but `require_diagnostics` used `require_file` (non-empty) on `00_<gene>.complete_seqs.fa`, which is legitimately **empty** in that case, so the run died immediately after the diagnostics stage with `Missing or empty required file (step00_complete_seqs)`.
+- Fixed with a `require_file_exists` check (presence, not size) applied to both split files: `complete_seqs.fa` is empty when no sequence has a complete ORF, and `incomplete_seqs.fa` is empty when every sequence does. Step 00 always writes both, so presence is the real prerequisite.
+- Verified end to end on real data: a 10-species gene built from the genuine incomplete-ORF sequences of `input_files/sequences/GUCA1B/GUCA1B_bat1k.fa` now runs diagnostics -> alignment -> events -> codeml ASR -> integrate -> plot and produces both figures. The pre-pass reports `0 complete-ORF (functional) lineage(s)` and fixes no ancestral indels; the gate reports `0/0`; MACSE runs on the undivided input with default frameshift costs, as intended.
+
+### Also verified in this release
+- GUCA1B `--alignment perform` from the raw `GUCA1B_bat1k.fa`: 93 complete / 10 incomplete, and **93/93 complete ORFs pass the gate**. (From the raw sequences `Doryrhina_cyclops` correctly lands in the incomplete set, where it belongs.)
+
+### Tests
+- `tests/reliable_split_and_orf_gate_test.py` gains warn-vs-stop coverage: `warn` returns instead of raising while still recording `FAIL` and writing the report, and `stop` names the flag in its abort message.
+- `tests/plot_smoke_test.sh` gains a third invocation with `--complete-orf-validation`, asserting both figures are still produced when a species is flagged and that omitting the file is a no-op.
+
+### VERSION bumped to 4.9.
+
 ## v4.8 - MACSE is told which sequences to trust; the conserved-block heuristic is removed; a hard pre-PAML gate on the complete ORFs
 
 Requested directly. Three connected changes: stop guessing after the fact which
