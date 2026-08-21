@@ -462,6 +462,109 @@ def mask_paml_stops(paml: Dict[str, str], order: List[str], registry: List[dict]
     return {name: "".join(out[name]) for name in order}, technical
 
 
+COMPLETE_ORF_VALIDATION_HEADER = [
+    "gene", "species", "complete_orf", "input_length", "aligned_length", "degapped_length",
+    "degapped_matches_input", "n_frameshift_markers", "n_incomplete_codon_cells",
+    "first_incomplete_codon_column", "incomplete_codon_cells", "verdict", "failure_reason",
+]
+
+
+def validate_complete_orf_alignment(gene, canonical_source, native, order, complete_species,
+                                    input_seqs, out, coordinate_system):
+    """Hard gate, run before anything is handed to PAML: a complete ORF must
+    come out of alignment still intact.
+
+    A sequence that entered step 00 with a complete ORF (ATG start, length a
+    multiple of three, no internal in-frame STOP) describes a real, unbroken
+    reading frame. Alignment is only allowed to insert gaps around it -- never
+    to edit it, never to break its codon phase. Every complete-ORF row must
+    therefore satisfy all three of:
+
+      1. `degapped_matches_input` -- stripping the gap characters from its
+         aligned row reproduces its input sequence EXACTLY. Any mismatch means
+         alignment invented, dropped or altered a real nucleotide.
+      2. `n_frameshift_markers == 0` -- no MACSE `!` partial-codon placeholder
+         anywhere in the row. A `!` in a complete ORF is MACSE asserting a
+         frameshift in a sequence that by construction has none; step 01 sets
+         `-fs`/`-fs_term` prohibitively high for exactly this reason, and this
+         gate confirms it worked.
+      3. `n_incomplete_codon_cells == 0` -- every codon cell (columns 3k+1..3k+3)
+         is either three real residues or exactly `---`. A mixed cell such as
+         `AT-` means the alignment split a codon across a gap boundary, so the
+         codon frame that PAML, the STOP scan and the ORF walk all assume is
+         not actually there.
+
+    Any violation aborts before PAML and leaves
+    `02_<gene>.complete_orf_alignment_validation.tsv` behind as the diagnostic
+    report. The report is written on success too, so a clean run is auditable
+    rather than merely silent.
+    """
+    rows = []
+    failures = []
+    complete = set(complete_species)
+    for species in order:
+        aligned = native[species]
+        source = canonical_source.get(species, aligned)
+        degapped = aligned.replace("-", "")
+        expected = input_seqs.get(species)
+        n_markers = source.count("!")
+        bad_cells = []
+        for start in range(0, len(aligned), 3):
+            cell = aligned[start:start + 3]
+            if len(cell) != 3:
+                bad_cells.append(start + 1)
+                continue
+            gaps = cell.count("-")
+            if gaps not in (0, 3):
+                bad_cells.append(start + 1)
+        matches = expected is not None and degapped == expected
+        is_complete = species in complete
+        reasons = []
+        if is_complete:
+            if not matches:
+                reasons.append("degapped_row_does_not_reproduce_input_sequence"
+                               if expected is not None else "input_sequence_unavailable")
+            if n_markers:
+                reasons.append(f"{n_markers}_frameshift_marker(s)_in_a_complete_ORF")
+            if bad_cells:
+                reasons.append(f"{len(bad_cells)}_incomplete_codon_cell(s)")
+        verdict = "not_applicable" if not is_complete else ("pass" if not reasons else "FAIL")
+        row = {
+            "gene": gene, "species": species, "complete_orf": is_complete,
+            "input_length": len(expected) if expected is not None else "NA",
+            "aligned_length": len(aligned), "degapped_length": len(degapped),
+            "degapped_matches_input": matches,
+            "n_frameshift_markers": n_markers,
+            "n_incomplete_codon_cells": len(bad_cells),
+            "first_incomplete_codon_column": bad_cells[0] if bad_cells else "NA",
+            "incomplete_codon_cells": ",".join(str(c) for c in bad_cells[:50]) or "NA",
+            "verdict": verdict,
+            "failure_reason": ";".join(reasons) or "NA",
+        }
+        rows.append(row)
+        if verdict == "FAIL":
+            failures.append(row)
+
+    report = out / f"02_{gene}.complete_orf_alignment_validation.tsv"
+    write_tsv(rows, report, COMPLETE_ORF_VALIDATION_HEADER)
+    n_complete = sum(1 for r in rows if r["complete_orf"])
+    if failures:
+        detail = "\n".join(
+            f"    {r['species']}: {r['failure_reason']}" for r in failures[:20])
+        more = f"\n    ... and {len(failures) - 20} more" if len(failures) > 20 else ""
+        raise SystemExit(
+            f"[ERROR] {gene}: {len(failures)} of {n_complete} complete-ORF sequence(s) did not survive "
+            f"alignment intact. Pensieve stops here rather than handing a corrupted reading frame to "
+            f"PAML.\n{detail}{more}\n"
+            f"    Diagnostic report: {report}\n"
+            f"    Coordinate system: {coordinate_system}"
+        )
+    print(f"Complete-ORF alignment validation for {gene}: {n_complete}/{n_complete} complete ORFs "
+          f"reproduce their input exactly, carry no frameshift markers, and sit on whole codon cells "
+          f"({report.name})")
+    return rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build Pensieve's canonical native and PAML-safe alignments.")
     parser.add_argument("--gene", required=True)
@@ -515,6 +618,21 @@ def main() -> None:
 
     length = validate_equal_alignment(native, order, ALLOWED_DEFINED, "native canonical alignment")
     validate_equal_alignment(paml_pre, order, ALLOWED_DEFINED, "PAML pre-mask alignment")
+
+    # Hard pre-PAML gate on the complete ORFs (see validate_complete_orf_alignment).
+    # Deliberately placed before the PAML-safe view, the STOP registry and every
+    # output file: nothing downstream should exist if a complete reading frame
+    # was corrupted by alignment.
+    orf_rows = read_tsv(r0 / f"00_{gene}.orf_status.tsv")
+    complete_species = [r["species"] for r in orf_rows
+                        if str(r.get("complete_orf", "")).strip().lower() == "true"]
+    input_path = r0 / f"00_{gene}.common_species.gapless_for_macse.fasta"
+    if not input_path.exists():
+        input_path = r0 / f"00_{gene}.common_species.fasta"
+    input_raw, _input_order = read_fasta(input_path)
+    input_seqs = {name: seq.replace("-", "") for name, seq in input_raw.items()}
+    validate_complete_orf_alignment(gene, canonical_source, native, order, complete_species,
+                                    input_seqs, out, coordinate_system)
 
     if args.alignment_mode == "perform":
         # MACSE ran: join raw STOP calls to MACSE frame-phase diagnostics and

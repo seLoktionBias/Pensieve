@@ -69,7 +69,7 @@ def write_table(path, header, rows):
 
 def test_static_and_cli():
     print("static architecture and CLI")
-    check((ROOT / "VERSION").read_text().strip() == "4.5", "VERSION is 4.5")
+    check((ROOT / "VERSION").read_text().strip() == "4.8", "VERSION is 4.8")
     ctl = (ROOT / "templates" / "dummy_codon_asr.ctl").read_text()
     for token, msg in [
         ("clock = 0", "codeml clock=0"),
@@ -107,7 +107,7 @@ def test_static_and_cli():
         check(r.returncode == 0 and "Pensieve" in r.stdout, f"help form {' '.join(args)} works")
     long_help = subprocess.run([sys.executable, str(ROOT / "bin" / "pensieve"), "--help", "-long"],
                                capture_output=True, text=True).stdout
-    check("Pensieve v4.5 - full manual" in long_help, "long help reports v4.5")
+    check("Pensieve v4.8 - full manual" in long_help, "long help reports v4.8")
     check("diagnostics < alignment < events < asr < integrate < plot" in long_help,
           "long help documents actual stage order")
 
@@ -432,10 +432,55 @@ def test_events_with_different_affected_tips_are_not_merged_even_on_the_same_bra
         }
     rows = [
         row(10, 12, "A,B", "T|IND0001|gain0001"),
-        row(13, 15, "C,D", "T|IND0002|gain0002"),  # contiguous, same branch, DIFFERENT tips
+        row(13, 15, "C,D", "T|IND0002|gain0002"),  # contiguous, same branch, DISJOINT tips
     ]
     merged = mod.merge_contiguous_same_type_indel_events(rows)
-    check(len(merged) == 2, f"two events with different affected tips stay two events even when contiguous on the same branch ({merged})")
+    check(len(merged) == 2, f"two events with disjoint affected tips stay two events even when contiguous on the same branch ({merged})")
+
+
+def test_overlapping_affected_tips_contiguous_events_are_clubbed():
+    # v4.6, requested directly (real CNGA3 Node102->Node101): a 2128-2131 4bp
+    # deletion (carried by Micronycteris_megalotis, Myotis_myotis) and a
+    # contiguous 2132-2133 2bp deletion (carried by Carollia, Glyphonycteris,
+    # Micronycteris_megalotis, Myotis_myotis, Trinycteris) are one 6bp in-frame
+    # deletion at that branch, later partially reverted in some descendants --
+    # NOT two separate frameshift deletions. Because the two fragments' affected
+    # tips OVERLAP (they share carriers), that overlap is positive evidence of a
+    # single common origin, so they are clubbed by position; the merged event
+    # spans the full 6bp, is in-frame, and takes the union of affected tips.
+    print("contiguous same-branch same-type fragments with OVERLAPPING affected tips are clubbed by position")
+    mod = load("03_alignment_events")
+    def row(start, end, tips, event_id):
+        length = end - start + 1
+        return {
+            "gene": "T", "event_id": event_id, "character_class": "indel",
+            "event_type": "indel_gain", "biological_interpretation": "deletion",
+            "alignment_start": start, "alignment_end": end, "event_length": length,
+            "length_mod_3": length % 3, "frame_effect": "in_frame" if length % 3 == 0 else "frameshift",
+            "origin_node": "Node101", "origin_is_tip": False, "parent_node": "Node102",
+            "branch": "Node102->Node101", "shared_event": True, "n_affected_tips": len(tips.split(",")),
+            "affected_tips": tips, "reversal_below_origin": False, "secondary_changes_below_origin": "NA",
+            "root_state": "absent", "parsimony_score": "1", "delta_parsimony_support": "inf",
+            "ambiguous_origin": False, "direction_confident": True,
+            "parent_age": "2.0", "child_age": "1.0", "age_interval": "2.0-1.0",
+            "n_observed_present": len(tips.split(",")), "n_observed_absent": 1, "n_unknown": 0,
+            "observed_present_tips": tips, "breakpoint_relationships": "NA",
+            "coordinate_system": "primary_codon_alignment",
+        }
+    rows = [
+        row(2128, 2131, "Micronycteris,Myotis_myotis", "T|IND0047|gain0001"),
+        row(2132, 2133, "Carollia,Glyphonycteris,Micronycteris,Myotis_myotis,Trinycteris", "T|IND0048|gain0002"),
+    ]
+    merged = mod.merge_contiguous_same_type_indel_events(rows)
+    check(len(merged) == 1, f"the overlapping contiguous 4bp+2bp pair is clubbed into one event ({len(merged)})")
+    m = merged[0]
+    check(int(m["alignment_start"]) == 2128 and int(m["alignment_end"]) == 2133 and int(m["event_length"]) == 6,
+          f"the clubbed event spans the full 2128-2133 6bp region ({m['alignment_start']}-{m['alignment_end']})")
+    check(int(m["length_mod_3"]) == 0 and m["frame_effect"] == "in_frame",
+          "the clubbed 4bp+2bp deletion is correctly reported as a single 6bp IN-FRAME deletion")
+    check(set(m["affected_tips"].split(",")) ==
+          {"Micronycteris", "Myotis_myotis", "Carollia", "Glyphonycteris", "Trinycteris"},
+          f"the clubbed event takes the union of affected tips ({m['affected_tips']})")
 
 
 def test_nested_interior_event_does_not_block_merging_the_events_around_it():
@@ -579,7 +624,14 @@ def test_compensated_frameshift_stop_classification():
         tmp = Path(td); r0 = tmp/"r0"; r1 = tmp/"r1"; r2 = tmp/"r2"
         r0.mkdir(); r1.mkdir(); r2.mkdir()
         raw_a = "ATGAAACCCTGAGGGCCC"  # premature TGA at raw nt 10-12
-        raw_b = "ATGAAACCCCCCGGGCCC"
+        # B is the complete ORF here, so it must survive the v4.8 pre-PAML gate
+        # (validate_complete_orf_alignment): its aligned row has to degap back to
+        # exactly this sequence, carry no '!' and sit on whole codon cells. It is
+        # therefore three codons longer than A and carries real residues opposite
+        # A's frame-restoration markers, instead of the sub-codon gaps an earlier
+        # version of this fixture used -- which described an alignment Pensieve now
+        # (correctly) refuses to hand to PAML.
+        raw_b = "ATGCAAAGGCCCCCCGGGCCC"
         (r0/"00_T.common_species.gapless_for_macse.fasta").write_text(f">A\n{raw_a}\n>B\n{raw_b}\n")
         (r0/"00_T.common_species.fasta").write_text(f">A\n{raw_a}\n>B\n{raw_b}\n")
         (r0/"00_T.common_species.tree").write_text("(A:1,B:1);\n")
@@ -596,7 +648,7 @@ def test_compensated_frameshift_stop_classification():
         # cumulative frame correction is 3 mod 3 = 0, so the STOP is back in
         # phase and must remain an independent nonsense candidate.
         macse_a = "ATG!AAA!!CCCTGAGGGCCC"
-        macse_b = "ATG-AAA--CCCCCCGGGCCC"
+        macse_b = "ATGCAAAGGCCCCCCGGGCCC"
         (r1/"01_T.macse_NT.fasta").write_text(f">A\n{macse_a}\n>B\n{macse_b}\n")
         (r1/"01_T.macse_AA.fasta").write_text(">A\nXXXXXXX\n>B\nXXXXXXX\n")
         r = subprocess.run([sys.executable, str(ROOT/"scripts"/"01_run_macse_and_extract_events.py"),
@@ -1035,7 +1087,11 @@ for line in seq.read_text().splitlines():
 if name is not None: records.append((name,''.join(chunks)))
 with outnt.open('w') as n, outaa.open('w') as a:
     for name,s in records:
-        if name in {'A','B'}: s=s[:6]+'---'+s[9:]
+        # A/B get a whole-codon gap INSERTED (not real residues overwritten):
+        # every sequence here is a complete ORF, so the v4.8 pre-PAML gate
+        # requires each row to degap back to its exact input and to sit on whole
+        # codon cells. C/D are padded to the same width.
+        s = s[:6]+'---'+s[6:] if name in {'A','B'} else s+'---'
         n.write(f'>{name}\n{s}\n')
         a.write(f'>{name}\n'+('X'*(len(s)//3))+'\n')
 ''')
@@ -1078,7 +1134,11 @@ for line in seq.read_text().splitlines():
 if name is not None: records.append((name,''.join(chunks)))
 with outnt.open('w') as n, outaa.open('w') as a:
     for name,s in records:
-        if name in {'A','B'}: s=s[:6]+'---'+s[9:]
+        # A/B get a whole-codon gap INSERTED (not real residues overwritten):
+        # every sequence here is a complete ORF, so the v4.8 pre-PAML gate
+        # requires each row to degap back to its exact input and to sit on whole
+        # codon cells. C/D are padded to the same width.
+        s = s[:6]+'---'+s[6:] if name in {'A','B'} else s+'---'
         n.write(f'>{name}\n{s}\n')
         a.write(f'>{name}\n'+('X'*(len(s)//3))+'\n')
 ''')
@@ -1087,7 +1147,10 @@ with outnt.open('w') as n, outaa.open('w') as a:
         mock_codeml = bindir / "codeml"
         mock_codeml.write_text(r'''#!/usr/bin/env python3
 from pathlib import Path
-seq='ATGCCCAAAGGGTTTCCC'
+# 21 columns: the mock MACSE above INSERTS a whole-codon gap rather than
+# overwriting residues (required by the v4.8 pre-PAML complete-ORF gate), so the
+# canonical alignment is 21 wide and every marginal ancestral sequence must be too.
+seq='ATGCCCAAAGGGTTTCCCAAA'
 Path('rst').write_text(f"""tree with node labels for Rod Page's TreeView
 ((1_A:0.1,2_B:0.1)6:0.1,(3_C:0.1,4_D:0.1)7:0.1)5;
 Nodes 5 to 7 are ancestral
@@ -1740,137 +1803,6 @@ def test_raw_to_alignment_map_survives_multiple_scattered_insertions():
               f"({aligned[col-1]!r}) matches the raw base ({raw_seq[raw_pos-1]!r})")
 
 
-def test_block_realignment_always_produces_codon_multiple_width():
-    # Real bug, found running real CNGA3 data (Bat_genes_from_Song):
-    # realign_block_content() (scripts/01_run_macse_and_extract_events.py)
-    # used to align differing-length block candidates as raw NUCLEOTIDE
-    # strings with MUSCLE, which has no notion of a codon boundary at the
-    # nucleotide level. The resulting block width, concatenated with the
-    # remainder (always an exact multiple of 3 from MACSE), left the WHOLE
-    # canonical alignment not divisible by 3, and
-    # 02_prepare_asr_inputs.py's existing "will not silently add/remove
-    # columns" guard correctly refused to accept it -- CNGA3/macse failed
-    # outright. v4.2 removed MUSCLE entirely; this rare differing-length
-    # case is now realigned by MACSE itself (the single alignment engine
-    # everywhere in the pipeline), which is frame-aware by construction.
-    print("block realignment (differing-length accepted MACSE edits) always yields a codon-multiple width")
-    mod = load("01_run_macse_and_extract_events")
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        bindir = tmp / "bin"; bindir.mkdir()
-        mock_macse = bindir / "macse"
-        # A trivial mock aligner matching MACSE's own CLI shape
-        # (-prog alignSequences -seq IN -out_NT NT -out_AA AA). Pads every
-        # sequence on the right with '-' to the longest input length,
-        # deliberately not codon-aware itself -- the fix must not depend on
-        # the mock proving anything about real MACSE's alignment quality,
-        # only that realign_block_content() never calls an external MUSCLE
-        # binary and always yields a rectangular, codon-multiple width.
-        mock_macse.write_text(r'''#!/usr/bin/env python3
-import sys
-from pathlib import Path
-args = sys.argv[1:]
-def val(k): return args[args.index(k) + 1]
-inp = Path(val('-seq')); nt_out = Path(val('-out_NT')); aa_out = Path(val('-out_AA'))
-records = []
-name = None; chunks = []
-for line in inp.read_text().splitlines():
-    if line.startswith('>'):
-        if name is not None: records.append((name, ''.join(chunks)))
-        name = line[1:].split()[0]; chunks = []
-    else:
-        chunks.append(line.strip())
-if name is not None: records.append((name, ''.join(chunks)))
-width = max(len(s) for _, s in records)
-for outp in (nt_out, aa_out):
-    with outp.open('w') as f:
-        for name, s in records:
-            f.write(f'>{name}\n{s.ljust(width, "-")}\n')
-''')
-        mock_macse.chmod(0o755)
-
-        # Three species: two share the same 9nt block (3 codons), one has a
-        # genuine 3nt insertion inside it (12nt, 4 codons) -- an accepted,
-        # length-changing block edit, the exact real-data shape that broke.
-        block_content = {
-            "A": "ATGGGCGAG",
-            "B": "ATGGGCGAG",
-            "C": "ATGAAAGGCGAG",
-        }
-        aligned = mod.realign_block_content(block_content, str(mock_macse), tmp / "work", tmp / "macse.log")
-        check(set(aligned) == set(block_content), "every species is present in the realigned block")
-        widths = {len(s) for s in aligned.values()}
-        check(len(widths) == 1, f"realigned block is rectangular (widths={widths})")
-        width = widths.pop()
-        check(width % 3 == 0, f"realigned block width ({width}) is a multiple of 3")
-        for name, seq in aligned.items():
-            real = seq.replace("-", "")
-            check(len(real) % 3 == 0,
-                  f"{name}'s own real (gap-stripped) content ({real!r}) is itself a whole number of codons")
-
-
-def test_block_realignment_does_not_trim_non_codon_multiple_candidates():
-    # Real bug, found running real GUCA1C data (reported directly by the
-    # user: Desmodus_rotundus's own real 'C' at raw position 90 silently
-    # vanished, misreported as a deletion). realign_block_content() used to
-    # trim every candidate to its own largest multiple of 3 before calling
-    # MACSE, inherited unmodified from the old, since-removed MUSCLE-based
-    # implementation where that trim was genuinely required (protecting
-    # translate_codon_seq from a desynchronising partial trailing codon).
-    # MACSE never had that requirement -- it aligns raw nucleotides directly
-    # and is exactly the tool designed to handle non-codon-multiple input.
-    # A block candidate can legitimately be non-codon-multiple in length
-    # because it contains a masked 'N' standing in for one of MACSE's own
-    # inferred positions -- and that 'N' is not necessarily trailing, so
-    # trimming from the end silently discarded real, already-accepted raw
-    # content (in the real case: an 'N' immediately followed by one real
-    # trailing nucleotide, both lost together to a 2-character end-trim).
-    print("block realignment never discards trailing real content from a non-codon-multiple candidate")
-    mod = load("01_run_macse_and_extract_events")
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        bindir = tmp / "bin"; bindir.mkdir()
-        mock_macse = bindir / "macse"
-        # Records exactly what it received, untouched, as its own "alignment"
-        # (right-padded to the longest input) -- this test only needs to
-        # prove nothing was discarded before the aligner ever ran.
-        mock_macse.write_text(r'''#!/usr/bin/env python3
-import sys
-from pathlib import Path
-args = sys.argv[1:]
-def val(k): return args[args.index(k) + 1]
-inp = Path(val('-seq')); nt_out = Path(val('-out_NT')); aa_out = Path(val('-out_AA'))
-records = []
-name = None; chunks = []
-for line in inp.read_text().splitlines():
-    if line.startswith('>'):
-        if name is not None: records.append((name, ''.join(chunks)))
-        name = line[1:].split()[0]; chunks = []
-    else:
-        chunks.append(line.strip())
-if name is not None: records.append((name, ''.join(chunks)))
-width = max(len(s) for _, s in records)
-width += (3 - width % 3) % 3  # real MACSE always yields a codon-multiple output width
-for outp in (nt_out, aa_out):
-    with outp.open('w') as f:
-        for name, s in records:
-            f.write(f'>{name}\n{s.ljust(width, "-")}\n')
-''')
-        mock_macse.chmod(0o755)
-
-        # A: ordinary 9nt candidate (3 codons), needs no correction.
-        # B: an accepted MACSE edit ending in a masked 'N' immediately
-        # followed by ONE more real nucleotide -- 11 characters total, NOT
-        # a multiple of 3 (exactly the real GUCA1C/Desmodus_rotundus shape:
-        # "...GGAATAT" + masked N + real "C").
-        block_content = {"A": "ATGGGCGAG", "B": "ATGGGCGANC"}
-        aligned = mod.realign_block_content(block_content, str(mock_macse), tmp / "work", tmp / "macse.log")
-        check(aligned["B"].replace("-", "") == block_content["B"],
-              f"B's full candidate, including its trailing real nucleotide after the masked N, "
-              f"reaches the aligner untouched (got {aligned['B'].replace('-', '')!r}, "
-              f"expected {block_content['B']!r})")
-
-
 def test_no_muscle_in_active_runtime_code():
     # Mandatory acceptance criterion (v4.2): MUSCLE is removed completely.
     # There must be no --aligner option and no runtime code path that can
@@ -1907,6 +1839,7 @@ def main():
     test_adjacent_different_type_indel_events_are_not_merged()
     test_contiguous_shared_events_with_identical_affected_tips_are_merged()
     test_events_with_different_affected_tips_are_not_merged_even_on_the_same_branch()
+    test_overlapping_affected_tips_contiguous_events_are_clubbed()
     test_nested_interior_event_does_not_block_merging_the_events_around_it()
     test_parsimony_tie_and_direction()
     test_stop_alleles_are_separate()
@@ -1932,8 +1865,6 @@ def main():
     test_intact_parent_resets_history_for_independently_disabled_children()
     test_map_raw_nt_to_aln_skips_macse_synthetic_ambiguity_code()
     test_raw_to_alignment_map_survives_multiple_scattered_insertions()
-    test_block_realignment_always_produces_codon_multiple_width()
-    test_block_realignment_does_not_trim_non_codon_multiple_candidates()
     test_no_muscle_in_active_runtime_code()
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")

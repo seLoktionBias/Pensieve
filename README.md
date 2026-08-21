@@ -4,12 +4,15 @@
 
 Pensieve is a gene-centred workflow for reconstructing **where coding-sequence lesions arose on a rooted species tree**. It combines a frameshift-aware MACSE alignment, PAML `codeml` ancestral nucleotide reconstruction, and its own parsimony-based event/history engine to answer, for any coding gene and any rooted tree of species: *which lineage lost this gene first, is the loss shared or independent, and what exactly broke it (a premature stop, a frameshifting indel, or something ambiguous)?* The result is a fully reconstructed ancestral sequence at every internal node and two publication-ready figures per gene.
 
-v3.31 made installation/execution portable across local machines and HPC systems (no assumption of Miniforge, mamba, or any site-specific module command); every release since has kept that portability while fixing real bugs found by running Pensieve on real genomes, listed in full in [`CHANGELOG.md`](CHANGELOG.md). The current release is **v4.5** (see `VERSION`).
+v3.31 made installation/execution portable across local machines and HPC systems (no assumption of Miniforge, mamba, or any site-specific module command); every release since has kept that portability while fixing real bugs found by running Pensieve on real genomes, listed in full in [`CHANGELOG.md`](CHANGELOG.md). The current release is **v4.8** (see `VERSION`).
 
-**Recent highlights (v4.3–v4.5):**
+**Recent highlights (v4.3–v4.8):**
 
 - **Three-way ORF status.** Every tip and every reconstructed ancestor is classified as **intact** (complete ORF), **pseudogenized/disrupted** (an in-frame premature stop or an *internal* frameshift indel), or **partial** (incomplete — missing ATG and/or length not a multiple of three and/or truncated — but with no premature stop and no internal frameshift). Incompleteness alone is never treated as evidence of pseudogenization; partial branches are drawn orange.
-- **Functional-consensus ancestral indels** (`--min-functional-witnesses`, default 2). When two or more phylogenetically independent complete-ORF lineages share exactly the same indel, it is fixed as ancestral rather than reconstructed as an implausible convergent gain on each lineage (the biological reading is an ancestral indel preserved in the functional lineages and lost in the mostly-pseudogenized ones).
+- **Functional-shared ancestral indels, decided before reconstruction** (`--min-functional-witnesses`, default 2). A pre-pass in the `diagnostics` stage compares, for every indel, which functional (complete-ORF) lineages carry it against which pseudogenized ones, and records the verdict in `01b_<GENE>.functional_shared_indels.tsv`. An indel that the functional lineages **share** — carried by at least two phylogenetically independent functional lineages *and* by strictly more functional lineages than definitely lack it — is fixed as ancestral rather than reconstructed as an implausible convergent gain on each lineage. Pseudogenized lineages are not equivalent witnesses: a dead gene accumulates arbitrary indels, so their agreement alone never makes an indel ancestral.
+- **Direction-aware event merging.** Fragments of one real indel on one branch are merged by what happened (`indel_gain`/`indel_loss`), not by the printed confidence label, and are merged across columns that were already gap in both the parent and the child — an indel is defined relative to the parent's sequence. The merged event's length is the material actually gained or lost, so the frame effect stays correct.
+- **MACSE is told which sequences it may trust.** Step 00 splits the gapless CDS by ORF completeness into `complete_seqs.fa` / `incomplete_seqs.fa`; step 01 runs `macse -seq complete_seqs.fa -seq_lr incomplete_seqs.fa -fs 1000 -fs_term 1000`, so a frameshift inside a complete ORF is prohibitively expensive while the real lesions in the pseudogenized set stay cheap. This replaces the conserved 5′ start-block heuristic, which is **removed** — it only ever checked the first 30 codons.
+- **A hard pre-PAML gate on the complete ORFs.** Before anything reaches PAML, every complete ORF must reproduce its input sequence exactly after degapping, carry zero MACSE `!` markers, and occupy only whole codon cells (three residues or `---`). Any violation stops the pipeline and writes `02_<GENE>.complete_orf_alignment_validation.tsv`.
 - **`--alignment defined` runs with no MACSE**, reading premature stops directly off the supplied codon frame; `scripts/prepare_defined_alignment.py` is an opt-in helper to make an off-frame curated alignment ready (assembly-gap masking + trailing all-gap trim).
 - **Clearer figures.** A red **×** marks any tip whose CDS lacks an ATG start codon; frameshift insertions and deletions are coloured separately; terminal (5′/3′) indels are drawn as non-disabling; and figure legends are now **fixed and complete**, so they are identical and directly comparable across genes and between `--alignment perform` and `--alignment defined`.
 - **IndelMaP has been removed** entirely; the core PAML+Pensieve inference is unchanged.
@@ -353,13 +356,43 @@ biological_interpretation = ambiguous_indel_change / ambiguous_stop_change
 
 This prevents the v3.25 failure in which a root tie could be rendered as a definitive deletion.
 
-### Functional-consensus ancestral indels
+### Functional-shared ancestral indels
 
 ```bash
 --min-functional-witnesses 2   # default; 0 disables
 ```
 
-Complete-ORF (functional) lineages are trustworthy witnesses of the functional ancestral sequence. When this many or more **phylogenetically independent** functional lineages carry exactly the same indel, Pensieve fixes that indel as **present at their common functional ancestor** before parsimony resolves the rest of the tree, rather than reconstructing an independent gain on each functional branch. Convergent gain of the identical indel in several independent functional lineages is biologically implausible; the parsimonious reading is an ancestral indel preserved in the functional lineages and lost — via random post-pseudogenization mutations — in the mostly-pseudogenized lineages that lack it (real GUCY2F/column-2772 case, where four independent functional lineages carrying a 1 bp deletion were otherwise reconstructed as four independent deletions "resurrecting" the gene). Characters fixed this way are flagged `functional_ancestral_indel` in `03_<GENE>.alignment_characters.tsv`.
+Complete-ORF (functional) lineages are trustworthy witnesses of the functional ancestral sequence: several **phylogenetically independent** functional lineages acquiring exactly the same indel convergently is very close to impossible. Pseudogenized lineages are *not* witnesses in the same sense — a dead gene accumulates arbitrary indels, so any number of pseudogenized lineages can independently gain or destroy the same event, and their agreement carries little information about the ancestral state.
+
+Pensieve therefore fixes an indel as **present along the ancestral paths of its functional carriers** — before parsimony resolves the rest of the tree — when **all** of the following hold:
+
+1. at least `--min-functional-witnesses` functional lineages carry it;
+2. it is the **functional consensus**: strictly more functional lineages carry it than definitely lack it;
+3. the carriers are **independent**: they occur in at least two distinct child subtrees of their MRCA, whose subtree also contains a definite non-carrier (so a lineage-specific indel of one functional clade does not qualify).
+
+Requirement 2 applies the same implausibility symmetrically. Fixing a *minority* variant as ancestral would assert that every functional lineage lacking it independently restored the exact deleted bases — which is what produced the dispersed, "repeatedly resurrected gene" event patterns in real PDE6C (cols 107–108: 7 functional carriers against 83 non-carriers, reconstructed as 1 gain + 20 losses) and real CNGB3 (3319–3324, 3355–3357). It applies to in-frame indels as well as frameshifts.
+
+The comparison is made **once, in the `diagnostics` stage**, by `scripts/01b_functional_shared_indels.py`, on the tip alignment as soon as it exists (after MACSE under `--alignment perform`, straight after step 00 under `--alignment defined`), using the same character-coding functions the event stage uses. Every indel character is written to `01b_<GENE>.functional_shared_indels.tsv` with its evidence and the `reason` it was or was not accepted:
+
+```
+character_id  alignment_start  alignment_end  character_length  frame_effect
+n_functional_present  n_functional_absent  n_functional_unknown
+n_pseudogenized_present  n_pseudogenized_absent
+n_independent_functional_lineages  mrca_of_functional_carriers
+ancestral_functional_indel  reason  functional_carriers
+```
+
+`03_alignment_events.py --functional-shared-indels <file>` then applies those recorded verdicts when it reconstructs the whole alignment (tips plus, downstream, the integrated ancestral sequences). Characters fixed this way are flagged `functional_ancestral_indel` in `03_<GENE>.alignment_characters.tsv`. Omitting the flag recomputes the identical rule in-line.
+
+### Event merging
+
+Breakpoint decomposition deliberately splits one branch's indel into several comparable characters whenever another lineage shares only part of the span. For that branch's own event list those fragments are re-merged when they are the same real event:
+
+- **same direction** — grouped by `event_type` (`indel_gain` / `indel_loss`), never by the printed `biological_interpretation`, so a fragment that prints `ambiguous_indel_change` merges with the contiguous `deletion` beside it. A merged cluster containing any non-confident fragment stays `ambiguous_indel_change`: merging never invents confidence. A deletion adjacent to an insertion is never merged.
+- **nothing real in between** — exactly contiguous, or separated only by columns already gap in **both** the parent and the child. An indel is defined relative to the parent's sequence, so inherited gap columns carry no material and the fragments are adjacent in real coordinates.
+- **overlapping affected tips** — positive evidence of one common origin. Disjoint adjacent events stay separate.
+
+For a merge that bridged inherited gap columns, `event_length` is the number of columns actually gained or lost (the sum of the fragments), while `alignment_start`/`alignment_end` keep the outer span; `breakpoint_relationships` records the fragments and how many inherited gap columns were crossed.
 
 ## Signed frame arithmetic
 
@@ -561,6 +594,8 @@ GENE.phylogenetic_tip_order.tsv
 GENE.phylogenetic_sequence_order.tsv
 GENE.alignment_events.tsv
 GENE.alignment_characters.tsv
+GENE.functional_shared_indels.tsv               # functional vs pseudogenized carriers per indel
+GENE.complete_orf_alignment_validation.tsv      # (supporting_files) pre-PAML complete-ORF gate
 GENE.ancestral_orf_walk.tsv
 GENE.orf_transitions_by_branch.tsv
 GENE.ancestral_integrated_alignment.fa         # same phylogenetic row order

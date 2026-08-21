@@ -109,6 +109,22 @@ coord <- data.frame(node = seq_along(pp$xx), x = pp$xx, y = pp$yy,
                     label = c(tr$tip.label, tr$node.label),
                     isTip = c(rep(TRUE, ntip), rep(FALSE, tr$Nnode)),
                     stringsAsFactors = FALSE)
+
+# Cladogram only (--dated no, where x is node depth, not meaningful time): give
+# the TERMINAL region more horizontal room. Most reconstructed events fall on or
+# near terminal branches, so a plain cladogram crowds their per-branch event
+# ticks. A monotone convex remap of x (x -> (x/max)^p * max, p>1) pulls the deep
+# internal nodes toward the root and stretches the near-tip region, so tip
+# branches are longer and internal branches shorter while every tip stays
+# aligned at the same right-hand x (labels still line up). Never applied when
+# --dated yes: there the x-axis is real time and must not be distorted.
+if (!dated) {
+  mx <- max(coord$x, na.rm = TRUE)
+  if (is.finite(mx) && mx > 0) {
+    stretch_p <- 2.2
+    coord$x <- (coord$x / mx) ^ stretch_p * mx
+  }
+}
 edge_df <- data.frame(parent = tr$edge[, 1], child = tr$edge[, 2])
 edge_df <- merge(edge_df, coord[, c("node", "x", "y", "label")], by.x = "parent", by.y = "node", all.x = TRUE)
 names(edge_df)[names(edge_df) %in% c("x", "y", "label")] <- c("parent_x", "parent_y", "parent_label")

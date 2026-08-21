@@ -5,7 +5,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 echo "[1/11] CLI help forms"
 for flag in -h -help --help; do python bin/pensieve "$flag" >/dev/null; done
 python bin/pensieve --help -long > /tmp/pensieve_long_help.$$
-grep -q "Pensieve v4.5 - full manual" /tmp/pensieve_long_help.$$
+grep -q "Pensieve v4.8 - full manual" /tmp/pensieve_long_help.$$
 grep -q "diagnostics < alignment < events < asr < integrate < plot" /tmp/pensieve_long_help.$$
 rm -f /tmp/pensieve_long_help.$$
 
@@ -20,6 +20,13 @@ python tests/backend_consistency_test.py
 
 echo "[5/11] Reference-free + safe codeml exit tests"
 python tests/paml_exit_and_reference_free_test.py
+
+echo "[5b/11] Functional-shared ancestral indels + event merging"
+python tests/functional_shared_indel_test.py
+python tests/orf_aware_parsimony_test.py
+
+echo "[5c/11] Reliable/less-reliable MACSE split + pre-PAML complete-ORF gate"
+python tests/reliable_split_and_orf_gate_test.py
 
 echo "[6/11] codeml control file"
 grep -Eq '^clock[[:space:]]*=[[:space:]]*0' templates/dummy_codon_asr.ctl

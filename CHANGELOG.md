@@ -1,5 +1,107 @@
 # Changelog
 
+## v4.8 - MACSE is told which sequences to trust; the conserved-block heuristic is removed; a hard pre-PAML gate on the complete ORFs
+
+Requested directly. Three connected changes: stop guessing after the fact which
+part of MACSE's output to distrust, declare reliability up front instead, and
+then verify the result rather than assume it.
+
+### Removed: the conserved 5' start-block heuristic
+- `detect_conserved_block()`, `resolve_conserved_block()`, `realign_block_content()`, `block_reference()`, `block_quality_scores()` and the `01_<gene>.conserved_block_correction.tsv` / `01_<gene>.block_remainder_input.fasta` / `01_<gene>.block_realign.log` outputs are all gone, along with the second MACSE invocation on the "remainder" and the block-realignment pass.
+- Why: it repaired MACSE's damage after the fact and only inside a narrow window. The block length was nominally data-driven but capped at a hard-coded `max_probe_codons=30` (90 bp) with a permissive `identity_threshold=0.3`, and on every real gene measured the detector ran straight into that ceiling (`block_codons=30` for CNGA3, CNGB3, GRK7, GUCA1B, GUCA1C and PDE6C, including all 103 species of the current PDE6C run) — so in practice it was a fixed 90 bp window. It also needed `min_species=5` complete ORFs or it silently disabled itself, and it covered only the 5' end: a MACSE mis-correction anywhere past codon 30 was never examined. None of the three constants was exposed as a CLI flag.
+
+### New: the MACSE input is split by ORF completeness and reliability is declared up front
+- `00_prune_and_check_orf.py` now writes, after the ORF audit and terminal-stop trim, `00_<gene>.complete_seqs.fa` (every `complete_orf=True` species) and `00_<gene>.incomplete_seqs.fa` (everything else), both gapless. The split comes from the same `orf_check` result that fills `orf_status.tsv`, so the two can never disagree.
+- `01_run_macse_and_extract_events.py` runs
+
+      macse -prog alignSequences -seq complete_seqs.fa -seq_lr incomplete_seqs.fa \
+            -fs 1000 -fs_term 1000 -out_NT ... -out_AA ...
+
+  `-seq_lr` is MACSE's own documented slot for pseudogenes. A frameshift proposed inside a complete ORF now costs 1000 (`-fs`), 1000 at its first or last codon (`-fs_term`), so MACSE will always prefer another explanation instead of breaking open an intact reading frame to make a genuinely broken lineage align more cheaply. Frameshifts in the less-reliable set keep MACSE's default cost, which is the point: that is where the real lesions are.
+- A gene with no complete ORF at all falls back to the undivided input with default costs and logs a warning (`-seq` is mandatory, `-seq_lr` alone is not valid MACSE input, and forbidding frameshifts in sequences known to be frameshifted would be wrong).
+
+### New: a hard pre-PAML gate on the complete ORFs — `validate_complete_orf_alignment()`
+- A sequence that entered step 00 with a complete ORF describes a real, unbroken reading frame; alignment may only put gaps around it. `02_prepare_asr_inputs.py` now enforces that directly, immediately after the native alignment is validated and **before** the PAML-safe view, the stop registry or any output file exists. Every `complete_orf=True` species must satisfy all three of:
+  1. `degapped_matches_input` — stripping gaps from its aligned row reproduces its step-00 input sequence exactly (catches an invented, dropped or altered nucleotide, including MACSE emitting a synthetic `N`);
+  2. `n_frameshift_markers == 0` — no MACSE `!` anywhere in its row;
+  3. `n_incomplete_codon_cells == 0` — every codon cell (columns 3k+1..3k+3) is either three real residues or exactly `---`, never a mixed cell like `AT-`.
+- Incomplete-ORF species are reported (`verdict=not_applicable`) but never gate the pipeline — they are expected to be frameshifted.
+- Any violation aborts with a per-species reason and leaves the diagnostic report `02_<gene>.complete_orf_alignment_validation.tsv` behind; the report is written on success too, so a clean run is auditable rather than merely silent. Copied to `final_results/<gene>/supporting_files/`.
+- The gate is not hypothetical, and the reliability split is what makes it passable. Real 103-species PDE6C, same input, `--alignment perform`, measured directly on `01_PDE6C.macse_NT.fasta`:
+
+  | | old (block heuristic, default `-fs`) | new (`-seq`/`-seq_lr`, `-fs 1000 -fs_term 1000`) |
+  |---|---|---|
+  | alignment width | 2967 | 2952 |
+  | complete ORFs carrying `!` | **91 of 91** (273 markers) | **0 of 91** (0 markers) |
+  | complete ORFs with mixed codon cells | **91 of 91** | **0 of 91** |
+  | complete ORFs failing the degap check | 0 | 0 |
+  | incomplete ORFs carrying `!` | 12 of 12 (97 markers) | 11 of 12 (67 markers) |
+
+  So the old pipeline was inserting a median of 3 frameshift markers into *every* complete-ORF sequence — corruption the 90 bp conserved-block window could not have seen — while the lesions in the pseudogenized set are preserved. `02_PDE6C.complete_orf_alignment_validation.tsv` records 91 `pass` and 12 `not_applicable`.
+- Scanning the previously shipped `final_results` canonical alignments for condition 3 alone: PDE6C 89 of 91 complete ORFs affected, GUCY2F 7 of 7, CNGB3 2 of 28. In `--alignment defined` mode the same gate found a genuine curation defect in GUCA1B: `Doryrhina_cyclops` is a complete ORF whose aligned row nonetheless reads `...GGTG [-AA] ------` and `... [G--] TAC...`, i.e. two codons straddling a gap boundary. **`--alignment defined` on that curated alignment now stops until the row is corrected.**
+
+### Tests
+- New `tests/reliable_split_and_orf_gate_test.py`: the conserved-block symbols are gone from all runtime code; step 00's split matches `orf_status.tsv` exactly, is gapless, and has the terminal stop already removed; step 01 builds the exact `-seq/-seq_lr/-fs 1000/-fs_term 1000` command line; the no-complete-ORF fallback never passes `-seq_lr` alone and never forbids frameshifts; and the gate passes an intact complete ORF while rejecting an altered residue, a `!` marker and a split codon, naming each violation in the report.
+- The two obsolete `test_block_realignment_*` tests are removed with the code they covered.
+- Two pre-existing fixtures described alignments the new gate correctly refuses and were corrected: `test_compensated_frameshift_stop_classification`'s complete-ORF species now carries real residues opposite the other sequence's frame-restoration markers instead of sub-codon gaps, and the runner mocks now INSERT a whole-codon gap rather than overwriting three real nucleotides (with the mock codeml's ancestral sequences widened to match).
+
+### VERSION bumped to 4.8.
+
+## v4.7 - functional-shared ancestral indels decided before reconstruction, and a direction-aware event merge
+
+Prompted by direct inspection of the real 103-species results for the eight bat
+visual genes: the SAME indel event was appearing dispersed over many separate
+functional branches, so a gene read as if it had been repeatedly broken and
+resurrected. CNGB3 and PDE6C were the clearest cases. Two independent causes,
+both fixed here.
+
+### New stage-`diagnostics` pre-pass: `scripts/01b_functional_shared_indels.py`
+- Requested directly: right after the alignment exists -- after `01_run_macse_and_extract_events.py` under `--alignment perform`, straight after `00_prune_and_check_orf.py` under `--alignment defined` -- infer the indel characters with the algorithm already used downstream, identify the indels SHARED BETWEEN FUNCTIONAL BRANCHES as opposed to pseudogenized ones, record them in a file, and use that record to drive the later inference over the whole alignment (tips plus the integrated ancestral sequences).
+- The new script codes the tip alignment into breakpoint-defined indel characters using the very same functions the event stage uses (`cluster_indel_characters`, `decompose_run`, `indel_tip_states`, imported from `03_alignment_events.py`, not copied), scores every character's functional vs pseudogenized carriers, and writes `01b_<gene>.functional_shared_indels.tsv` -- one row per indel character with the full evidence (`n_functional_present/absent/unknown`, `n_pseudogenized_present/absent`, `n_independent_functional_lineages`, `mrca_of_functional_carriers`), the verdict `ancestral_functional_indel`, and the `reason` it was or was not accepted.
+- Under `--alignment perform` the pre-pass reads `01_<gene>.macse_NT.fasta` and renders MACSE's `!` placeholder as `-` exactly as step 02 does for the canonical native view, so the pre-pass, the reconstruction and every downstream coordinate refer to the same columns.
+- `03_alignment_events.py` gains `--functional-shared-indels`; the runner passes the pre-pass file and `require_diagnostics`/`require_events` now require it. The verdicts drive the reconstruction; when no file is given the identical rule is recomputed in-line, and the two paths produce byte-identical event tables (regression-tested). The file is published to `final_results/<gene>/important_output/<gene>.functional_shared_indels.tsv`.
+
+### Real bug: the functional-consensus rule fixed MINORITY indels as ancestral, which is what dispersed the events
+- The v4.5/v4.6 rule pinned an indel ancestral as soon as >=2 independent complete-ORF lineages carried it, with no regard for how many functional lineages definitely LACKED it. That inverts the very implausibility the rule rests on: if a handful of functional lineages carry the indel and most functional lineages do not, calling it ancestral asserts that dozens of independent lineages each precisely restored the deleted bases.
+- Measured on the real data: PDE6C IND0009 (cols 107-108) had 7 functional carriers against 83 functional non-carriers and was pinned ancestral, producing 1 gain + 20 loss events for one 2 bp gap; PDE6C IND0026 (col 201) 4 vs 88 -> 2 gains + 14 losses; CNGB3 IND0987-IND0990 (3319-3324) and IND1000/IND1001 (3355-3357) had 4-8 functional carriers against 20-24 non-carriers and produced 11-15 loss events each. Inspecting the alignment confirms these are 5'-truncation and gap-rich-region artefacts, not homologous indels.
+- Fixed: an indel is ancestral only when it is the FUNCTIONAL CONSENSUS -- strictly more functional lineages carry it than definitely lack it -- in addition to the existing witness count and independence requirements (which are also strengthened: carriers must occur in at least two distinct child subtrees of their MRCA, not merely have a non-carrier somewhere below it). Pseudogenized carriers never make up the difference: a dead gene accumulates arbitrary indels, so any number of pseudogenized lineages can independently gain or lose the same event and their agreement is not evidence of ancestry. The decision lives in one function, `functional_shared_indel_verdict()`, shared by the pre-pass and the reconstruction.
+
+### The v4.6 frameshift-only restriction is removed (the consensus guard replaces it)
+- v4.6 had to ban in-frame indels from the rule wholesale because the un-guarded rule shattered clade-shared in-frame indels (real CNGA3 cols 409/472). Those two characters are exactly minority-among-functional characters (26 carriers vs 65, and 34 vs 57) and the consensus guard rejects them directly, so the blanket restriction is no longer needed and is lifted.
+- Consequence: a genuine functional-consensus IN-FRAME indel is finally reconstructed as ancestral instead of as repeated deletions on functional branches. Real CNGB3 IND0230 (cols 781-783, 16 functional carriers vs 11) was the only such character in CNGB3/PDE6C and is now ancestral.
+- Net effect on the real data (identical inputs, `--alignment defined --dated no`): CNGB3 1925 -> 1566 events at the event stage, with spans carrying >=2 purely-functional-branch events falling from 11 spans/47 events (v4.5) and 7/19 (v4.6) to 4/8; PDE6C 190 -> 150 events, with such events falling from 79 (v4.5) and 57 (v4.6) to 31.
+
+### Real bug: contiguous fragments of one indel were left unmerged when they differed only in parsimony CONFIDENCE
+- Reported directly ("multiple cases of indels where they should have been merged but were not"). `merge_contiguous_same_type_indel_events()` grouped a branch's fragments by `biological_interpretation`, so a fragment printed `ambiguous_indel_change` (because parsimony was tied somewhere relevant) never merged with the contiguous `deletion` next to it -- even though both are the same `indel_gain` on the same branch affecting the same tips. Real CNGB3 `Node53->Micronycteris_megalotis` reported one 18 bp deletion as 1231-1236 `deletion` + 1237-1242 `ambiguous` + 1243-1248 `deletion`. A systematic scan of the shipped results found 116 such contiguous same-direction pairs in CNGB3 alone and ~280 across the eight genes.
+- Fixed: fragments are grouped by `event_type` (`indel_gain`/`indel_loss`), i.e. by what actually happened, never by the printed label. A merged cluster containing any non-confident fragment is itself reported `ambiguous_indel_change` with `direction_confident=False`, so merging never invents confidence. A deletion adjacent to an insertion has a different `event_type` and is still never merged. After the fix, zero contiguous same-direction same-tip pairs remain unmerged in CNGB3 or PDE6C (the only contiguous pairs left are 8 genuine deletion/insertion neighbours).
+
+### New: fragments separated only by INHERITED gap columns are merged (an indel is defined relative to the parent's sequence)
+- Also found by the same scan: two same-branch, same-direction fragments sharing affected tips were left separate whenever the columns between them were already gap in BOTH the parent and the child -- i.e. inherited gap carrying no real sequence at all. In the parent's own sequence those fragments are adjacent, so they are one indel. Real CNGB3 `Node92->Dasypterus_ega` loses 2260-2289 and 2293-2304 across an inherited 2290-2292 gap: one 42 bp deletion, previously reported as two.
+- `03_alignment_events.py` now builds a per-node gap reconstruction (tips from their own alignment row, internal nodes from the unambiguous character assignment) and hands it to the merge, which bridges a pair only when every intervening column is gap in both the parent and the child. 171 such merges on real CNGB3, 2 on PDE6C; the bridging condition was verified to hold for every one of them against the independently written character/node-state tables.
+- For a bridged merge `event_length` is the number of columns actually gained or lost (the sum of the fragments), not the outer span, so the frame effect stays correct: 14 CNGB3 merges have a span whose length mod 3 differs from the true event length, and a bridged 1 bp + 1 bp pair is now one 2 bp frameshift rather than two. `alignment_start`/`alignment_end` still record the outer span (that is what the figures draw), and `breakpoint_relationships` records how many inherited gap columns were crossed.
+
+### Tests
+- New `tests/functional_shared_indel_test.py`: the consensus guard (minority rejected with the reason recorded, majority accepted), pseudogenized carriers unable to override the functional comparison, in-frame eligibility, a single functional clade's lineage-specific indel correctly refused, the pin actually collapsing the dispersed per-lineage gains, pre-pass file vs in-line recomputation byte-identical, and direct unit tests of every merge rule (confidence-mixed clusters, opposite directions, disjoint tips, inherited-gap bridging, bridged length/frame arithmetic).
+- `tests/orf_aware_parsimony_test.py`, `tests/paml_exit_and_reference_free_test.py` and `tests/backend_consistency_test.py` all still pass unchanged.
+
+### VERSION bumped to 4.7.
+
+## v4.6 - shared-event calling, event clubbing, and cladogram branch spacing
+
+Prompted by direct inspection of real 103-species CNGA3 results.
+
+### Real bug: the functional-consensus ancestral-indel rule (v4.5) over-fired on IN-FRAME indels and shattered clade-shared events
+- Reported directly: CNGA3 column 409 (a 3 bp in-frame insertion) shared across a clade was reconstructed as ~10 independent lineage events instead of one ancestral event; the 472 in-frame deletion region behaved the same way. Root cause: v4.5's functional-consensus pin (fix an indel shared by >=2 independent functional lineages as ancestral) was applied to EVERY indel. Its whole purpose is to counteract the asymmetric cheap-gain prior (`--gain-cost` < `--loss-cost`), which biases only disabling-lesion characters toward independent convergent gains; ordinary in-frame indels are reconstructed with the neutral 1:1 cost and have no such bias. Worse, because BOTH the gap and the residue of a common in-frame indel are typically carried by many functional lineages, the rule arbitrarily pinned whichever state was the gap, forcing the other state to be re-gained independently many times.
+- Fixed: the functional-consensus pin now applies ONLY to frameshift indels (`orf_relevant`, length not a multiple of 3), the same characters the asymmetric prior acts on. In-frame indels are left to neutral symmetric parsimony. Verified on real CNGA3: total events dropped from 202 to ~113, column 409 collapsed from 10 events to 2 (one large shared ancestral event plus one lineage-specific), and the 472 region now reconstructs a large shared ancestral deletion core with lineage-specific length extensions. The GUCY2F/column-2772 frameshift case (the rule's original purpose) is unchanged.
+
+### Event clubbing now merges contiguous same-branch fragments whose affected-tip sets OVERLAP (not only when identical)
+- Reported directly (real CNGA3 Node102->Node101): a 2128-2131 4 bp deletion and a contiguous 2132-2133 2 bp deletion were reported as two separate frameshift deletions when together they are one 6 bp IN-FRAME deletion at that branch (later partially reverted in some descendants). The merge previously required the fragments' affected-tip sets to be IDENTICAL. Now two contiguous same-type fragments on one branch are clubbed when their tip sets OVERLAP (share >=1 carrier) -- overlap is positive evidence of a single common origin; the clubbed event spans the full region, is re-typed by its true combined length (here in-frame), and takes the UNION of affected tips. DISJOINT adjacent events are still left separate (Sankoff can coincidentally place two unrelated characters' origin on one branch). New regression test `test_overlapping_affected_tips_contiguous_events_are_clubbed`; the existing disjoint-tips test is retained.
+
+### Figures: cladogram (`--dated no`) gives terminal branches more room
+- Requested directly: most reconstructed events fall on or near terminal branches, so a plain cladogram crowds their per-branch event ticks. In `--dated no` mode only (where x is node depth, not meaningful time), `05_plot_events.R` now applies a monotone convex remap of the node x-coordinates (`x -> (x/max)^p * max`, p = 2.2) that pulls deep internal nodes toward the root and stretches the near-tip region: tip branches are longer, internal branches shorter, and every tip stays aligned at the same right-hand x so labels still line up. Never applied under `--dated yes`, where the x-axis is real time.
+
+### VERSION bumped to 4.6.
+
 ## v4.5 - functional-consensus ancestral indels, and IndelMaP removed entirely
 
 ### New: an indel shared by multiple independent functional lineages is fixed as ancestral (`--min-functional-witnesses`, default 2)

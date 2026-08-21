@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import sys
 from pathlib import Path
 from Bio import Phylo, SeqIO
 
@@ -205,9 +206,11 @@ def main():
     status_rows = []
     failure_rows = []
     complete_rows = []
+    orf_by_species = {}
 
     for s in common:
         ch = orf_check(recs[s])
+        orf_by_species[s] = ch
         row = {"gene": gene, "species": s}
         for k in ["sequence_length", "starts_with_atg", "length_multiple_of_3", "terminal_codon", "has_terminal_stop", "premature_stop_count", "premature_stop_codons", "complete_orf"]:
             row[k] = ch[k]
@@ -223,11 +226,41 @@ def main():
         for codpos, nt1, nt2, codon in ch["premature_details"]:
             failure_rows.append({"gene": gene, "species": s, "failure_type": "premature_in_frame_stop", "codon_position": codpos, "nt_start": nt1, "nt_end": nt2, "codon": codon, "details": "raw_unaligned_sequence"})
 
+    # Split the gapless CDS by ORF completeness so MACSE can be told which
+    # sequences it is allowed to trust. Complete ORFs go to `-seq` (reliable);
+    # everything else goes to `-seq_lr` (less reliable, MACSE's own documented
+    # slot for pseudogenes). A frameshift proposed inside a reliable sequence
+    # then costs `-fs`, which step 01 sets prohibitively high, so MACSE cannot
+    # "fix" an intact reading frame in order to make a broken lineage align
+    # more cheaply -- the failure mode the removed conserved-block heuristic
+    # was patching after the fact.
+    complete_species = [s for s in common if orf_by_species[s]["complete_orf"]]
+    incomplete_species = [s for s in common if not orf_by_species[s]["complete_orf"]]
+
+    def write_gapless(names, path):
+        with open(path, "w") as out:
+            for s in names:
+                seq = gapless_seq(recs[s])
+                out.write(f">{s}\n")
+                for i in range(0, len(seq), 80):
+                    out.write(seq[i:i + 80] + "\n")
+
+    write_gapless(complete_species, outdir / f"00_{gene}.complete_seqs.fa")
+    write_gapless(incomplete_species, outdir / f"00_{gene}.incomplete_seqs.fa")
+    print(f"ORF split for {gene}: {len(complete_species)} complete ORF sequence(s) -> "
+          f"00_{gene}.complete_seqs.fa (MACSE -seq); {len(incomplete_species)} incomplete -> "
+          f"00_{gene}.incomplete_seqs.fa (MACSE -seq_lr)")
+    if not complete_species:
+        print(f"[WARN] {gene}: no complete-ORF sequence; step 01 will pass every sequence to MACSE "
+              f"as reliable (-seq) because -seq_lr alone is not a valid MACSE input.", file=sys.stderr)
+
     write_tsv(status_rows, outdir / f"00_{gene}.orf_status.tsv", ["gene", "species", "sequence_length", "starts_with_atg", "length_multiple_of_3", "terminal_codon", "has_terminal_stop", "premature_stop_count", "premature_stop_codons", "complete_orf"])
     write_tsv(failure_rows, outdir / f"00_{gene}.orf_failures.tsv", ["gene", "species", "failure_type", "codon_position", "nt_start", "nt_end", "codon", "details"])
     write_tsv(complete_rows, outdir / f"00_{gene}.complete_orf_species.tsv", ["gene", "species", "sequence_length"])
 
-    print(f"Finished step00 for {gene}; common species: {len(common)}; coordinate system: canonical alignment")
+    print(f"Finished step00 for {gene}; common species: {len(common)}; "
+          f"complete ORFs: {len(complete_species)}; incomplete: {len(incomplete_species)}; "
+          f"coordinate system: canonical alignment")
 
 
 if __name__ == "__main__":

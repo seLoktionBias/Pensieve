@@ -100,9 +100,13 @@ require_diagnostics(){
   require_file "results_00/$GENE/00_${GENE}.orf_status.tsv" step00_orf_status
   # --alignment defined does not run MACSE at all, so its NT alignment is not a
   # prerequisite; the supplied codon alignment is used directly in step 02.
+  require_file "results_00/$GENE/00_${GENE}.complete_seqs.fa" step00_complete_seqs
+  # 00_<gene>.incomplete_seqs.fa is intentionally NOT required: a gene in which
+  # every sequence has a complete ORF legitimately produces an empty one.
   if [[ "$ALIGNMENT" == "perform" ]]; then
     require_file "results_01/$GENE/01_${GENE}.macse_NT.fasta" step01_macse_nt
   fi
+  require_file "results_01/$GENE/01b_${GENE}.functional_shared_indels.tsv" step01b_functional_shared_indels
 }
 require_alignment(){
   require_file "results_02/$GENE/02_${GENE}.primary_codon_alignment_native.fasta" native_alignment
@@ -114,6 +118,9 @@ require_events(){
   require_file "results_03/$GENE/03_${GENE}.alignment_characters.tsv" alignment_characters
   require_file "results_03/$GENE/03_${GENE}.alignment_character_node_states.tsv" character_states
   require_file "results_03/$GENE/03_${GENE}.pensieve_labelled_dated_tree.nwk" pensieve_tree
+}
+require_functional_shared_indels(){
+  require_file "results_01/$GENE/01b_${GENE}.functional_shared_indels.tsv" step01b_functional_shared_indels
 }
 require_asr(){
   local rst="results_02/$GENE/paml_codon_asr/rst"
@@ -146,6 +153,8 @@ copy_final_outputs(){
   mkdir -p "$important" "$support"
   copy_if_exists "results_03/$GENE/03_${GENE}.alignment_events.tsv" "$important/${GENE}.alignment_events.tsv"
   copy_if_exists "results_03/$GENE/03_${GENE}.alignment_characters.tsv" "$important/${GENE}.alignment_characters.tsv"
+  copy_if_exists "results_01/$GENE/01b_${GENE}.functional_shared_indels.tsv" "$important/${GENE}.functional_shared_indels.tsv"
+  copy_if_exists "results_02/$GENE/02_${GENE}.complete_orf_alignment_validation.tsv" "$support/${GENE}.complete_orf_alignment_validation.tsv"
   copy_if_exists "results_03/$GENE/04_${GENE}.orf_transitions_by_branch.tsv" "$important/${GENE}.orf_transitions_by_branch.tsv"
   copy_if_exists "results_03/$GENE/04_${GENE}.ancestral_orf_walk.tsv" "$important/${GENE}.ancestral_orf_walk.tsv"
   copy_if_exists "results_03/$GENE/03_${GENE}.ancestral_integrated_alignment.fa" "$important/${GENE}.ancestral_integrated_alignment.fa"
@@ -201,9 +210,23 @@ if step_in_range diagnostics; then
   if [[ "$ALIGNMENT" == "perform" ]]; then
     echo "[$(date)] STEP diagnostics: MACSE frameshift/STOP-aware alignment"
     python "$SCRIPT_DIR/01_run_macse_and_extract_events.py" --gene "$GENE" --step00-dir "results_00/$GENE" --outdir "results_01/$GENE"
+    DIAGNOSTIC_ALIGNMENT="results_01/$GENE/01_${GENE}.macse_NT.fasta"
   else
     echo "[$(date)] STEP diagnostics: --alignment defined -> skipping MACSE; the supplied codon alignment is used directly"
+    DIAGNOSTIC_ALIGNMENT="results_00/$GENE/00_${GENE}.common_species.fasta"
   fi
+  # Functional-shared ancestral indels are identified on the tip alignment as
+  # soon as it exists -- after MACSE in perform mode, straight after step 00 in
+  # defined mode -- and BEFORE anything is reconstructed. The recorded verdicts
+  # then drive the whole-alignment (tips + ancestral) inference in step 03.
+  echo "[$(date)] STEP diagnostics: functional-shared ancestral indels (functional vs pseudogenized lineages)"
+  python "$SCRIPT_DIR/01b_functional_shared_indels.py" --gene "$GENE" \
+    --alignment "$DIAGNOSTIC_ALIGNMENT" \
+    --tree "results_00/$GENE/00_${GENE}.common_species.tree" \
+    --orf-status "results_00/$GENE/00_${GENE}.orf_status.tsv" \
+    --breakpoint-tolerance "$BREAKPOINT_TOLERANCE" \
+    --min-functional-witnesses "$MIN_FUNCTIONAL_WITNESSES" \
+    --outdir "results_01/$GENE"
 elif prereq_needed diagnostics; then require_diagnostics; fi
 
 if step_in_range alignment; then
@@ -213,13 +236,14 @@ if step_in_range alignment; then
 elif prereq_needed alignment; then require_alignment; fi
 
 if step_in_range events; then
-  require_alignment
+  require_alignment; require_functional_shared_indels
   echo "[$(date)] STEP events: breakpoint-coded phylogenetic event reconstruction"
   python "$SCRIPT_DIR/03_alignment_events.py" --gene "$GENE" \
     --alignment "results_02/$GENE/02_${GENE}.primary_codon_alignment_native.fasta" \
     --tree "results_02/$GENE/02_${GENE}.tree_for_asr.nwk" \
     --masked-stops "results_02/$GENE/02_${GENE}.masked_inframe_premature_stops_after_macse_correction.tsv" \
     --orf-status "results_00/$GENE/00_${GENE}.orf_status.tsv" \
+    --functional-shared-indels "results_01/$GENE/01b_${GENE}.functional_shared_indels.tsv" \
     --orf-loss-cost "$ORF_LOSS_COST" --orf-restoration-cost "$ORF_RESTORATION_COST" \
     --pseudogenic-boundary-cap-votes "$PSEUDOGENIC_BOUNDARY_CAP_VOTES" \
     --min-functional-witnesses "$MIN_FUNCTIONAL_WITNESSES" \

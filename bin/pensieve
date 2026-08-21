@@ -167,7 +167,8 @@ def print_short_help():
       --env-name NAME          conda/mamba env name (default Pensieve)
       --min-functional-witnesses N
                                >=N independent complete-ORF lineages sharing an indel
-                               fix it as ancestral (default 2; 0 disables)
+                               fix it as ancestral, provided it is also the
+                               functional consensus (default 2; 0 disables)
       --tie-break none|ancestral|terminal
       --run_from_step STEP     diagnostics|alignment|events|asr|integrate|plot
       --run_up_to STEP         diagnostics|alignment|events|asr|integrate|plot
@@ -183,7 +184,7 @@ def print_short_help():
 def print_long_help():
     print(textwrap.dedent("""\
     ===========================================================================
-    Pensieve v4.5 - full manual
+    Pensieve v4.8 - full manual
     ===========================================================================
 
     PURPOSE
@@ -227,22 +228,26 @@ def print_long_help():
             it runs ONLY under --alignment perform: --alignment defined skips
             MACSE entirely and uses the supplied codon alignment directly.
 
-            Conserved start-block quality check: MACSE can place a frame-
+            Reliable vs less-reliable input: MACSE can place a frame-
             correction marker anywhere its own global alignment finds
             cheapest, not necessarily near the lineage whose real lesion
-            caused it -- observed corrupting the highly conserved gene-start
-            block for species whose own actual pseudogenizing lesion lies
-            elsewhere. Pensieve detects how many codons from position 1 the
-            complete-ORF sequences agree on closely (the conserved block),
-            then for any species where MACSE modified that block, keeps the
-            modification only if it scores no worse, and strictly better on
-            at least one of nucleotide/amino-acid identity against a
-            complete-ORF consensus, than the species' own untouched raw
-            sequence there; otherwise the raw block is used and MACSE is
-            re-run once on the corrected input (and, in the rare case
-            accepted block edits leave candidates of differing length, MACSE
-            itself -- not a second tool -- realigns just that block).
-            Decisions are logged to 01_<gene>.conserved_block_correction.tsv.
+            caused it -- observed breaking open an intact reading frame to
+            make a genuinely broken lineage align more cheaply. Pensieve
+            therefore tells MACSE which sequences it may trust rather than
+            second-guessing it afterwards. Step 00 splits the gapless CDS by
+            ORF completeness into 00_<gene>.complete_seqs.fa and
+            00_<gene>.incomplete_seqs.fa, and step 01 runs
+
+              macse -prog alignSequences \\
+                    -seq complete_seqs.fa -seq_lr incomplete_seqs.fa \\
+                    -fs 1000 -fs_term 1000
+
+            so a frameshift inside a complete ORF costs 1000 (1000 at its
+            first/last codon) while frameshifts in the less-reliable set --
+            where the real lesions are -- keep MACSE's default cost. If a
+            gene has no complete ORF at all, the undivided input is aligned
+            with default costs instead (-seq_lr alone is not valid MACSE
+            input).
 
       alignment
         02  Establish exactly one canonical coordinate system.
@@ -417,14 +422,29 @@ def print_long_help():
           alignment offset that should be clustered.
 
       --min-functional-witnesses N
-          default 2. When N or more phylogenetically INDEPENDENT complete-ORF
-          (functional) lineages carry exactly the same indel, that indel is
-          fixed as PRESENT at their common functional ancestor rather than
-          reconstructed as an independent gain on each lineage: convergent gain
-          of the identical indel in several independent functional lineages is
-          biologically implausible, so the parsimonious biological reading is an
-          ancestral indel preserved in the functional lineages and lost -- via
-          random post-pseudogenization mutations -- in the pseudogenized ones.
+          default 2. Threshold for the functional-shared ancestral-indel rule,
+          evaluated by the diagnostics-stage pre-pass
+          (01b_<gene>.functional_shared_indels.tsv) and applied when the whole
+          alignment is reconstructed. An indel is fixed as PRESENT along the
+          ancestral paths of its carriers when BOTH
+
+            (a) at least N phylogenetically INDEPENDENT complete-ORF
+                (functional) lineages carry exactly the same indel, and
+            (b) it is the functional CONSENSUS: strictly more functional
+                lineages carry it than definitely lack it.
+
+          Convergent gain of the identical indel in several independent
+          functional lineages is biologically implausible, so the parsimonious
+          biological reading is an ancestral indel preserved in the functional
+          lineages and lost -- via random post-pseudogenization mutations -- in
+          the pseudogenized ones. Pseudogenized lineages are not equivalent
+          witnesses: a dead gene accumulates arbitrary indels, so any number of
+          them can independently acquire or destroy the same event, and their
+          agreement alone never makes an indel ancestral. Requirement (b)
+          applies the same implausibility symmetrically -- calling a minority
+          variant ancestral would demand dozens of independent, exact
+          restorations instead -- and is what keeps the rule from dispersing one
+          indel into many events on functional branches.
           Set to 0 to disable (minimum meaningful value is 2). Requires tip ORF
           status (always available in the normal pipeline).
 

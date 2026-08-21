@@ -524,42 +524,134 @@ def mrca_node(carriers, root, tips_under):
         node = step
 
 
-def functional_consensus_pin(states, functional_tips, root, tips_under, node_by_name, min_witnesses):
-    """Return a {node_idx: PRESENT} pin map when an indel must be ancestral
-    because it is shared by >= min_witnesses phylogenetically INDEPENDENT
-    functional (complete-ORF) lineages; otherwise None.
+def functional_shared_indel_verdict(states, functional_tips, root, tips_under,
+                                   node_by_name, min_witnesses):
+    """Decide whether one indel character is a FUNCTIONAL-SHARED ANCESTRAL indel.
 
-    Rationale (real GUCY2F column-2772 case): complete-ORF lineages are
-    trustworthy witnesses of the functional ancestral sequence. When several
-    independent functional lineages all carry exactly the same indel,
-    convergently gaining it in each is far less plausible than it being present
-    in their common functional ancestor and then lost -- via random
-    post-pseudogenization insertions/substitutions -- in the mostly-pseudogenized
-    lineages that lack it.
+    This is the single source of truth for the rule, used both by the
+    stand-alone pre-pass (scripts/01b_functional_shared_indels.py, run straight
+    after the diagnostics stage on the tip alignment) and by the reconstruction
+    itself, so the pre-pass file and the reconstruction can never disagree.
 
-    The indel is therefore fixed PRESENT not only at the functional carriers'
-    common ancestor but at EVERY internal node on the paths from that ancestor
-    down to each functional carrier. Pinning the MRCA alone is not enough: with
-    the asymmetric cheap-gain cost the traceback would otherwise re-lose the gap
+    Biological rule (as requested, and as the real GUCY2F column-2772 /
+    CNGB3 / PDE6C cases demand):
+
+      * Complete-ORF (functional) lineages are the trustworthy witnesses of the
+        ancestral functional sequence. Several INDEPENDENT functional lineages
+        acquiring exactly the same indel convergently is very close to
+        impossible, so an indel that the functional lineages SHARE was present
+        in their common functional ancestor.
+      * Pseudogenized lineages are NOT witnesses in the same sense: a dead gene
+        accumulates arbitrary indels, and any number of pseudogenized lineages
+        can independently acquire (or destroy) any given indel. Sharing among
+        pseudogenized lineages therefore carries much less evidence about the
+        ancestral state, and must not by itself make an indel ancestral.
+
+    The rule is applied SYMMETRICALLY, which is what the previous version got
+    wrong. "Almost impossible to be acquired twice" cuts both ways: if only a
+    handful of functional lineages carry the indel while most functional
+    lineages definitely lack it, then calling it ancestral forces the *reverse*
+    impossibility -- dozens of independent lineages precisely restoring the
+    deleted bases. Real damage from the un-guarded rule (all measured on the
+    real 103-species data):
+
+        PDE6C IND0009 (cols 107-108):  7 functional carriers vs 83 functional
+            non-carriers -> pinned ancestral -> 1 gain + 20 losses (21 events
+            for one 2 bp gap, most of them on functional branches, reading as
+            repeated resurrection of the gene).
+        PDE6C IND0026 (col 201):       4 carriers vs 88 -> 2 gains + 14 losses.
+        CNGB3 IND0987-IND0990 (3319-3324) and IND1000/IND1001 (3355-3357):
+            4-8 functional carriers against 20-24 functional non-carriers,
+            each pinned ancestral and each producing 11-15 loss events.
+        CNGA3 IND0025 (409-411) / IND0030 (472-492): 26 vs 65 and 34 vs 57 --
+            the very characters that had to be excluded wholesale in v4.6 by
+            banning in-frame indels from the rule.
+
+    All of those are minority states among the functional lineages, and every
+    one of them is rejected by requiring the indel to be the functional
+    CONSENSUS. With that guard in place the frameshift-only restriction of
+    v4.6 is no longer needed and is removed, so a functional-consensus IN-FRAME
+    indel (real CNGB3 IND0230, cols 781-783: 16 functional carriers vs 11) is
+    finally reconstructed as ancestral instead of as repeated deletions.
+
+    Returns a dict of the evidence and the verdict; `is_ancestral` is True only
+    when ALL of the following hold:
+
+      1. at least `min_witnesses` functional tips carry the indel (PRESENT);
+      2. functional CONSENSUS: strictly more functional tips carry it than
+         definitely lack it (UNKNOWN/inapplicable tips never vote);
+      3. INDEPENDENCE: the carriers are not one clean clade -- their MRCA
+         subtree also holds a definite non-carrier, and carriers occur in at
+         least two different child subtrees of that MRCA.
+    """
+    functional = [t for t in functional_tips if t in states]
+    carriers = frozenset(t for t in functional if states.get(t) == PRESENT)
+    non_carriers = [t for t in functional if states.get(t) == ABSENT]
+    verdict = {
+        "n_functional_present": len(carriers),
+        "n_functional_absent": len(non_carriers),
+        "n_functional_unknown": sum(1 for t in functional if states.get(t) is None),
+        "n_pseudogenized_present": sum(1 for t, v in states.items()
+                                       if v == PRESENT and t not in functional_tips),
+        "n_pseudogenized_absent": sum(1 for t, v in states.items()
+                                      if v == ABSENT and t not in functional_tips),
+        "functional_carriers": ",".join(sorted(carriers)) or "NA",
+        "mrca_of_functional_carriers": "NA",
+        "n_independent_functional_lineages": 0,
+        "is_ancestral": False,
+        "reason": "",
+    }
+    if not min_witnesses or min_witnesses < 2:
+        verdict["reason"] = "rule_disabled"
+        return verdict
+    if len(carriers) < min_witnesses:
+        verdict["reason"] = f"fewer_than_{min_witnesses}_functional_carriers"
+        return verdict
+    if len(carriers) <= len(non_carriers):
+        # Not shared BY the functional lineages -- a minority variant among
+        # them. Pseudogenized carriers cannot make up the difference (they can
+        # acquire any indel at random), so this is not an ancestral indel.
+        verdict["reason"] = "not_the_functional_consensus_state"
+        return verdict
+    anc = mrca_node(carriers, root, tips_under)
+    verdict["mrca_of_functional_carriers"] = anc.name
+    carrying_children = sum(1 for child in anc.children
+                            if carriers & tips_under[child.idx])
+    verdict["n_independent_functional_lineages"] = carrying_children
+    if carrying_children < 2:
+        verdict["reason"] = "carriers_not_phylogenetically_independent"
+        return verdict
+    if not any(states.get(t) == ABSENT for t in tips_under[anc.idx]):
+        # A clean clade with no definite non-carrier inside it: a
+        # lineage-specific indel of that clade, not an ancestral one.
+        verdict["reason"] = "no_definite_non_carrier_under_mrca"
+        return verdict
+    verdict["is_ancestral"] = True
+    verdict["reason"] = "functional_consensus_ancestral_indel"
+    return verdict
+
+
+def functional_consensus_pin(states, functional_tips, root, tips_under, node_by_name,
+                             min_witnesses, verdict=None):
+    """Return a {node_idx: PRESENT} pin map for a functional-shared ancestral
+    indel (see functional_shared_indel_verdict), or None.
+
+    The indel is fixed PRESENT not only at the functional carriers' common
+    ancestor but at EVERY internal node on the paths from that ancestor down to
+    each functional carrier. Pinning the MRCA alone is not enough: with the
+    asymmetric cheap-gain cost the traceback would otherwise re-lose the gap
     just below the MRCA and re-gain it convergently on each functional branch --
     exactly the spurious independent deletion this rule exists to prevent. With
     the whole ancestor path pinned PRESENT, the functional lineages inherit the
     indel with no event and only the residue-carrier lineages record a loss.
-
-    "Independent" means the functional carriers are not one clean clade: their
-    MRCA subtree also contains a definite non-carrier (a tip scored ABSENT for
-    this character). Two functional carriers that are each other's closest
-    relatives (a lineage-specific shared indel in a single functional subclade)
-    do NOT trigger the rule.
     """
-    if not min_witnesses or min_witnesses < 2:
+    if verdict is None:
+        verdict = functional_shared_indel_verdict(states, functional_tips, root,
+                                                  tips_under, node_by_name, min_witnesses)
+    if not verdict["is_ancestral"]:
         return None
     carriers = frozenset(t for t in functional_tips if states.get(t) == PRESENT)
-    if len(carriers) < min_witnesses:
-        return None
     anc = mrca_node(carriers, root, tips_under)
-    if not any(states.get(t) == ABSENT for t in tips_under[anc.idx]):
-        return None
     pins = {}
     for tip_name in carriers:
         node = node_by_name[tip_name].parent
@@ -571,10 +663,36 @@ def functional_consensus_pin(states, functional_tips, root, tips_under, node_by_
     return pins or None
 
 
+FUNCTIONAL_SHARED_HEADER = [
+    "gene", "character_id", "alignment_start", "alignment_end", "character_length",
+    "length_mod_3", "frame_effect", "n_functional_present", "n_functional_absent",
+    "n_functional_unknown", "n_pseudogenized_present", "n_pseudogenized_absent",
+    "n_independent_functional_lineages", "mrca_of_functional_carriers",
+    "ancestral_functional_indel", "reason", "functional_carriers",
+]
+
+
+def read_functional_shared_indels(path):
+    """{(start, end): row} for every entry flagged ancestral_functional_indel."""
+    spans = {}
+    for row in read_tsv(path):
+        if not trueish(row.get("ancestral_functional_indel")):
+            continue
+        start = safe_int(row.get("alignment_start"))
+        end = safe_int(row.get("alignment_end"))
+        if start is None or end is None:
+            continue
+        spans[(start, end)] = row
+    return spans
+
+
 # ---------------------------------------------------------------- event merging
 
-def merge_contiguous_same_type_indel_events(event_rows):
-    """Real bug, found by inspecting real GUCA1C events directly: a single,
+def merge_contiguous_same_type_indel_events(event_rows, gap_at=None, aln_len=0):
+    """Re-merge, on ONE branch, the fragments that breakpoint decomposition split
+    out of what is really a single indel event.
+
+    Real bug, found by inspecting real GUCA1C events directly: a single,
     contiguous, single-type indel on one branch (e.g. Nyctalus_aviator's real
     6bp deletion at columns 400-405) can be reported as two or more SEPARATE
     events (a 1bp deletion at 400, then a 5bp deletion at 401-405) whenever
@@ -589,47 +707,86 @@ def merge_contiguous_same_type_indel_events(event_rows):
     sequence of same-type fragments -- and can even manufacture spurious
     frameshift signal (e.g. a 1bp + 5bp fragment pair each individually not a
     multiple of 3, when their true combined 6bp span is in-frame).
-    Directly requested: on ONE branch, two events of the SAME type (both
-    "deletion", both "insertion_or_restoration", or both "ambiguous_indel_change")
-    whose alignment spans are exactly contiguous (one starts the column
-    immediately after the other ends, no gap) are the same real event and
-    must be reported merged. Different types are never merged even when
-    adjacent (a deletion right next to an insertion is two real, different
-    events).
 
-    Originally this excluded every shared_event=True row (an event whose
-    origin is an internal/ancestral branch, inherited by multiple tips), on
-    the reasoning that a shared event's origin branch is answered by
-    ancestral parsimony rather than one lineage's own contiguous-span logic.
-    Real data (CNGA3's Node95->Node94 branch: a confident 18bp deletion at
-    466-483 immediately followed by a confident 3bp deletion at 484-486, both
-    shared by the exact same six Myotis/Eptesicus tips) showed that reasoning
-    was wrong -- the exact same breakpoint-decomposition fragmentation that
-    splits a single-tip event also splits a shared, ancestral one, and it is
-    just as fragmented and just as mergeable. Shared events ARE now merged,
-    but only when every field that defines "the same reconstructed event" on
-    that branch agrees, not just the branch and type: the exact same set of
-    affected tips. That guards against the different failure mode visible on
-    the same real branch, Node95->Node94, at columns 421 -- two GENUINELY
-    DIFFERENT characters (one affecting 6 tips, the other a disjoint set of
-    20) that happen to start at the same column and must stay two separate
-    events, not merge just because they share a branch label.
+    Two events on one branch are the same real event when they change the same
+    direction and the material between them is not real, retained sequence:
+
+    1. SAME DIRECTION, not the same printed label. Fragments are grouped by
+       `event_type` (`indel_gain` = gap appears, `indel_loss` = gap goes away),
+       never by `biological_interpretation`. This is a real fix: a fragment is
+       printed `ambiguous_indel_change` instead of `deletion`/`insertion_or_
+       restoration` purely because parsimony was tied somewhere relevant, which
+       is a statement about confidence, not about what happened. Grouping on the
+       printed label left 116 contiguous, same-direction, same-tip fragment
+       pairs unmerged on real CNGB3 alone (e.g. Micronycteris_megalotis's single
+       18 bp deletion reported as 1231-1236 `deletion` + 1237-1242 `ambiguous`
+       + 1243-1248 `deletion`), and ~280 across the eight real 103-species
+       genes. A merged cluster containing any non-confident fragment is itself
+       reported as `ambiguous_indel_change`, so no confidence is invented.
+       A deletion adjacent to an insertion still has a different `event_type`
+       and is still never merged.
+
+    2. EXACTLY CONTIGUOUS, or separated only by columns that were ALREADY GAP
+       ON BOTH SIDES OF THIS BRANCH. An indel event is defined relative to the
+       parent's sequence: if the parent already carried a gap at the columns
+       between two fragments (and the child still does, i.e. nothing changed
+       there on this branch), then in real sequence coordinates there is no
+       material between the fragments at all and they are one contiguous event.
+       Real CNGB3 case: Node92->Dasypterus_ega loses 2260-2289 and 2293-2304
+       while 2290-2292 is an inherited gap in both parent and child -- one 42 bp
+       deletion, previously reported as two. This bridging needs the per-node
+       gap reconstruction (`gap_at`); without it only exact contiguity merges.
+       For a bridged merge `event_length` is the number of columns actually
+       gained/lost (the sum of the fragments), NOT the outer span, so the frame
+       effect stays correct.
+
+    3. OVERLAPPING AFFECTED TIPS. Overlap is the evidence that the fragments are
+       one real indel at that branch which some descendants later partially
+       reverted (real CNGA3 Node101: a 2128-2131 4bp deletion and a contiguous
+       2132-2133 2bp deletion, sharing Micronycteris_megalotis/Myotis_myotis,
+       are one 6bp in-frame deletion, not two separate frameshifts). Two
+       DISJOINT adjacent events stay separate: Sankoff can coincidentally place
+       two unrelated characters' cheapest origin on one branch, and with no
+       shared carrier there is no positive evidence they are the same event.
+
+    Shared (ancestral-origin) events are merged on exactly the same terms --
+    real CNGA3 Node95->Node94, a confident 18bp deletion at 466-483 immediately
+    followed by a confident 3bp deletion at 484-486, both carried by the same
+    six Myotis/Eptesicus tips, is one event. The affected-tip overlap
+    requirement is what keeps that separate from the genuinely different pair
+    at column 421 on the same branch (6 tips vs a disjoint set of 20).
     """
-    MERGEABLE = {"deletion", "insertion_or_restoration", "ambiguous_indel_change"}
+    INDEL_KINDS = {"indel_gain", "indel_loss"}
     clusterable, other = [], []
     for row in event_rows:
-        if row["character_class"] == "indel" and row["biological_interpretation"] in MERGEABLE:
+        if row["character_class"] == "indel" and row["event_type"] in INDEL_KINDS:
             clusterable.append(row)
         else:
             other.append(row)
 
     by_key = defaultdict(list)
     for row in clusterable:
-        affected = frozenset(row["affected_tips"].split(","))
-        by_key[(row["branch"], row["biological_interpretation"], affected)].append(row)
+        by_key[(row["branch"], row["event_type"])].append(row)
+
+    def bridgeable(branch, prev_end, next_start):
+        """True when nothing real separates two fragments on this branch."""
+        if next_start == prev_end + 1:
+            return True                     # exactly contiguous
+        if gap_at is None or next_start <= prev_end:
+            return False
+        parent, _, child = branch.partition("->")
+        pmask, cmask = gap_at.get(parent), gap_at.get(child)
+        if pmask is None or cmask is None:
+            return False
+        for col in range(prev_end + 1, next_start):
+            if col < 1 or col > aln_len:
+                return False
+            if not (pmask[col - 1] and cmask[col - 1]):
+                return False               # real retained sequence in between
+        return True
 
     merged = []
-    for rows in by_key.values():
+    for (branch, _kind), rows in by_key.items():
         # Real bug, found by inspecting real CNGA3 events directly: Myotis_
         # auriculus's own 466-483 and 484-486 deletions did NOT merge even
         # though they are genuinely contiguous, same branch, same type, same
@@ -655,15 +812,21 @@ def merge_contiguous_same_type_indel_events(event_rows):
         nested = [r for r in rows if is_nested(r)]
         outer = [r for r in rows if not is_nested(r)]
         merged.extend(nested)
-        outer.sort(key=lambda r: int(r["alignment_start"]))
+        outer.sort(key=lambda r: (int(r["alignment_start"]), int(r["alignment_end"])))
         if outer:
             cluster = [outer[0]]
+            cluster_tips = set(outer[0]["affected_tips"].split(","))
             for row in outer[1:]:
-                if int(row["alignment_start"]) == int(cluster[-1]["alignment_end"]) + 1:
+                row_tips = set(row["affected_tips"].split(","))
+                if (bridgeable(branch, int(cluster[-1]["alignment_end"]),
+                               int(row["alignment_start"]))
+                        and (cluster_tips & row_tips)):
                     cluster.append(row)
+                    cluster_tips |= row_tips
                 else:
                     merged.append(_merge_event_cluster(cluster))
                     cluster = [row]
+                    cluster_tips = row_tips
             merged.append(_merge_event_cluster(cluster))
     return other + merged
 
@@ -673,18 +836,43 @@ def _merge_event_cluster(cluster):
         return cluster[0]
     start = int(cluster[0]["alignment_start"])
     end = int(cluster[-1]["alignment_end"])
-    length = end - start + 1
+    span = end - start + 1
+    # Length of the event is the number of columns actually gained/lost, which
+    # is the sum of the fragments. It equals the span for an exactly contiguous
+    # merge and is smaller when the merge bridged inherited gap columns.
+    length = sum(int(r["event_length"]) for r in cluster)
+    bridged = span - length
     widest = max(cluster, key=lambda r: int(r["event_length"]))  # most representative single character
     char_ids = [r["event_id"].split("|")[1] for r in cluster]
     kind_suffix = cluster[0]["event_id"].split("|")[2]
-    merged = dict(cluster[0])
+    # Affected tips of the clubbed event: the UNION across fragments (every
+    # lineage descending from this branch's combined indel, some of which later
+    # partially reverted part of it). The fragments' tip sets overlap but need
+    # not be identical.
+    union_tips = sorted(set().union(*(set(r["affected_tips"].split(",")) for r in cluster)) - {"NA", ""})
+    origin_is_tip = str(cluster[0].get("origin_is_tip")).strip().lower() == "true"
+    # Confidence never improves by merging: if any fragment's direction was not
+    # authoritative, the merged event is reported as an ambiguous change.
+    confident = all(trueish(r["direction_confident"]) for r in cluster)
+    if confident:
+        interpretation = cluster[0]["biological_interpretation"]
+    else:
+        interpretation = "ambiguous_indel_change"
+    merged = dict(widest)
     merged.update({
         "event_id": f"{cluster[0]['gene']}|{'+'.join(char_ids)}|{kind_suffix}",
+        "event_type": cluster[0]["event_type"],
+        "biological_interpretation": interpretation,
+        "direction_confident": confident,
+        "ambiguous_origin": any(trueish(r["ambiguous_origin"]) for r in cluster),
         "alignment_start": start,
         "alignment_end": end,
         "event_length": length,
         "length_mod_3": length % 3,
         "frame_effect": "in_frame" if length % 3 == 0 else "frameshift",
+        "affected_tips": ",".join(union_tips) or "NA",
+        "n_affected_tips": len(union_tips),
+        "shared_event": (not origin_is_tip) and len(union_tips) >= 2,
         "parsimony_score": format(sum(float(r["parsimony_score"]) for r in cluster), "g"),
         "delta_parsimony_support": min((r["delta_parsimony_support"] for r in cluster),
                                         key=lambda v: float("inf") if v in ("inf", "Infinity") else float(v)),
@@ -692,8 +880,10 @@ def _merge_event_cluster(cluster):
         "n_observed_absent": widest["n_observed_absent"],
         "n_unknown": widest["n_unknown"],
         "observed_present_tips": widest["observed_present_tips"],
-        "breakpoint_relationships": "merged_contiguous_same_type:" + "+".join(
-            f"{r['event_id'].split('|')[1]}({r['alignment_start']}-{r['alignment_end']})" for r in cluster),
+        "breakpoint_relationships": "merged_contiguous_same_type"
+            + (f"_bridging_{bridged}_inherited_gap_column(s)" if bridged else "") + ":"
+            + "+".join(f"{r['event_id'].split('|')[1]}({r['alignment_start']}-{r['alignment_end']})"
+                       for r in cluster),
     })
     return merged
 
@@ -1074,16 +1264,26 @@ def main():
                              "cost, regardless of how many real descendant tips it contains -- the cap "
                              "itself is this value times max(gain_cost, loss_cost) for that character.")
     parser.add_argument("--min-functional-witnesses", type=int, default=2,
-                        help="Functional-consensus ancestral-indel rule (requires --orf-status). If this "
-                             "many or more phylogenetically INDEPENDENT complete-ORF (functional) lineages "
-                             "carry exactly the same indel, that indel is fixed as PRESENT at their common "
-                             "functional ancestor instead of being reconstructed as an independent gain on "
-                             "each lineage -- convergent gain of the identical indel in several independent "
-                             "functional lineages is biologically implausible; the parsimonious, biological "
-                             "reading is an ancestral indel preserved in the functional lineages and lost "
-                             "(via random post-pseudogenization mutations) in the pseudogenized ones (real "
-                             "GUCY2F/column-2772 case). Set to 0 to disable; the minimum meaningful value "
-                             "is 2.")
+                        help="Functional-shared ancestral-indel rule (requires --orf-status). An indel is "
+                             "fixed as PRESENT along the ancestral paths of its carriers when at least this "
+                             "many phylogenetically INDEPENDENT complete-ORF (functional) lineages carry it "
+                             "AND it is the functional CONSENSUS (strictly more functional lineages carry it "
+                             "than definitely lack it). Convergent gain of the identical indel in several "
+                             "independent functional lineages is biologically implausible, so the "
+                             "parsimonious reading is an ancestral indel preserved in the functional "
+                             "lineages and lost -- via random post-pseudogenization mutations -- in the "
+                             "pseudogenized ones (real GUCY2F/column-2772 case). The consensus requirement "
+                             "applies the same implausibility symmetrically and is what keeps a minority "
+                             "variant among the functional lineages from being forced ancestral (real "
+                             "PDE6C 107-108 / CNGB3 3319-3324). Set to 0 to disable; minimum meaningful "
+                             "value is 2.")
+    parser.add_argument("--functional-shared-indels", default=None,
+                        help="01b_<gene>.functional_shared_indels.tsv from the pre-pass run straight after "
+                             "the diagnostics stage (scripts/01b_functional_shared_indels.py). When given, "
+                             "the set of ancestral functional-shared indels is taken from that file instead "
+                             "of being recomputed, so the whole-alignment (tips + reconstructed ancestors) "
+                             "inference is driven by the tip-level functional/pseudogenized comparison that "
+                             "was recorded and can be audited. The rule itself is identical either way.")
     args = parser.parse_args()
 
     if args.gain_cost <= 0 or args.loss_cost <= 0:
@@ -1222,9 +1422,24 @@ def main():
     use_functional_pin = bool(functional_tips) and args.min_functional_witnesses >= 2
     tips_under = subtree_tip_sets(nodes_post) if use_functional_pin else {}
     node_by_name = {n.name: n for n in nodes_post} if use_functional_pin else {}
+    shared_indel_spans = None
+    if args.functional_shared_indels:
+        shared_indel_spans = read_functional_shared_indels(args.functional_shared_indels)
+        print(f"[info] functional-shared ancestral indels read from the diagnostics-stage pre-pass: "
+              f"{len(shared_indel_spans)} span(s) ({args.functional_shared_indels})")
     functional_ancestral_ids = []
+    matched_shared_spans = set()
     event_rows, char_rows, state_rows = [], [], []
     present_at = defaultdict(set)          # node -> set of character ids
+    # node -> per-column gap mask (1 = gap). Tips are read straight off the
+    # alignment; internal nodes are filled in from the reconstruction below.
+    gap_at = {n.name: bytearray(aln_len) for n in nodes_post}
+    for tip in tips:
+        row = alignment[tip]
+        mask = gap_at[tip]
+        for i, ch in enumerate(row):
+            if ch == "-":
+                mask[i] = 1
     event_counter = 0
 
     for character in characters:
@@ -1251,14 +1466,40 @@ def main():
         # character's own gain/loss costs to scale the cap.
         boundary_cap = (args.pseudogenic_boundary_cap_votes * max(gain_cost, loss_cost)
                         if component_entry_idx else None)
-        # If two or more independent functional lineages share this indel, fix it
-        # PRESENT at their common functional ancestor rather than let parsimony
-        # reconstruct an implausible convergent gain on each functional branch.
-        pinned = (functional_consensus_pin(states, functional_tips, root, tips_under,
-                                           node_by_name, args.min_functional_witnesses)
-                  if use_functional_pin and character["klass"] == "indel" else None)
+        # FUNCTIONAL-SHARED ANCESTRAL INDEL (see functional_shared_indel_verdict).
+        # An indel that the functional (complete-ORF) lineages SHARE cannot
+        # plausibly have been gained convergently in each of them, so it is
+        # fixed PRESENT along the ancestral paths of its functional carriers
+        # instead of being reconstructed as an independent gain on every
+        # functional branch -- the "dispersed identical indel / repeatedly
+        # resurrected gene" pattern this rule exists to remove.
+        #
+        # The verdict is computed by the pre-pass on the diagnostics-stage tip
+        # alignment and read back from --functional-shared-indels; recomputing
+        # it here (same function, same alignment columns) is the fallback when
+        # no file is supplied. Applies to in-frame indels as well as
+        # frameshifts: the v4.6 frameshift-only restriction existed only to
+        # contain the un-guarded rule (real CNGA3 409/472), and the functional-
+        # consensus guard rejects those characters directly, so a genuine
+        # functional-consensus in-frame indel (real CNGB3 781-783) is no longer
+        # missed.
+        pinned = None
+        if use_functional_pin and character["klass"] == "indel":
+            if shared_indel_spans is not None:
+                is_ancestral = (character["start"], character["end"]) in shared_indel_spans
+            else:
+                is_ancestral = functional_shared_indel_verdict(
+                    states, functional_tips, root, tips_under, node_by_name,
+                    args.min_functional_witnesses)["is_ancestral"]
+            if is_ancestral:
+                pinned = functional_consensus_pin(
+                    states, functional_tips, root, tips_under, node_by_name,
+                    args.min_functional_witnesses,
+                    verdict={"is_ancestral": True})
         if pinned is not None:
             functional_ancestral_ids.append(character["id"])
+            if shared_indel_spans is not None:
+                matched_shared_spans.add((character["start"], character["end"]))
         assign, score, ambiguous, delta = sankoff(
             nodes_post, states, gain_cost, loss_cost, args.tie_break,
             component_entry_idx=component_entry_idx, boundary_cap=boundary_cap, pinned=pinned)
@@ -1268,6 +1509,13 @@ def main():
             is_ambiguous = node.idx in ambiguous
             if assign[node.idx] == PRESENT and not is_ambiguous:
                 present_at[node.name].add(character["id"])
+                # Per-node gap reconstruction, used by the event merge to tell an
+                # inherited gap between two fragments from real retained
+                # sequence. Tips use their own observed alignment row (below),
+                # which is authoritative; internal nodes use the reconstruction.
+                if character["klass"] == "indel" and not node.is_tip:
+                    for col in range(character["start"], character["end"] + 1):
+                        gap_at[node.name][col - 1] = 1
             if is_ambiguous:
                 state_label = "ambiguous"
             elif character["klass"] == "indel":
@@ -1384,7 +1632,19 @@ def main():
             "breakpoint_relationships": character["relationships"],
         })
 
-    event_rows = merge_contiguous_same_type_indel_events(event_rows)
+    if shared_indel_spans is not None:
+        unmatched = sorted(set(shared_indel_spans) - matched_shared_spans)
+        if unmatched:
+            # The pre-pass and this stage code the same characters from the same
+            # alignment columns, so every ancestral span must be found again. A
+            # mismatch means the file does not describe this alignment (wrong
+            # gene, stale run, or a different --breakpoint-tolerance).
+            print(f"[warn] {len(unmatched)} functional-shared ancestral span(s) from "
+                  f"{args.functional_shared_indels} matched no indel character in this alignment "
+                  f"(first: {unmatched[:5]}); check that the pre-pass file belongs to this run "
+                  f"and used the same --breakpoint-tolerance")
+
+    event_rows = merge_contiguous_same_type_indel_events(event_rows, gap_at=gap_at, aln_len=aln_len)
 
     # Flag every event that is a 5'/3'-terminal indel (computed on the final,
     # post-merge span). A frameshift-length terminal indel means the sequence is
@@ -1473,9 +1733,10 @@ def main():
     print(f"[result] {len(event_rows)} events on {len({r['branch'] for r in event_rows})} branches; "
           f"{len(shared)} shared; {len(ties)} with an exact parsimony tie")
     if use_functional_pin:
-        print(f"[info] functional-consensus rule (min {args.min_functional_witnesses} independent "
-              f"complete-ORF witnesses): {len(functional_ancestral_ids)} indel character(s) fixed as "
-              f"ancestral: {', '.join(functional_ancestral_ids) if functional_ancestral_ids else 'none'}")
+        print(f"[info] functional-shared ancestral indels (>={args.min_functional_witnesses} independent "
+              f"complete-ORF witnesses AND the functional consensus): "
+              f"{len(functional_ancestral_ids)} indel character(s) fixed as ancestral: "
+              f"{', '.join(functional_ancestral_ids) if functional_ancestral_ids else 'none'}")
     for row in sorted(shared, key=lambda r: (-int(r["event_length"]), int(r["alignment_start"])))[:15]:
         print(f"   {row['biological_interpretation']:<24} {row['alignment_start']}-{row['alignment_end']} "
               f"({row['event_length']} bp)  {row['branch']}  affects {row['n_affected_tips']}")
