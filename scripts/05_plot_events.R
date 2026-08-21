@@ -327,15 +327,54 @@ orf_labels <- c(
   intact = "No inferred disabling history",
   unknown = "No ancestral sequence")
 
-# The legends are FIXED and complete: every event-marker category and every
-# pseudogenization-history category is shown on every figure, whether or not it
-# happens to occur in a given gene's events. This keeps the figure legends
-# identical and directly comparable across genes and across --alignment perform
-# vs --alignment defined runs (a small synthetic gene and a large real gene get
-# the same, full legend), instead of a data-dependent subset. Order is the fixed
-# order these vectors are declared in.
+# The legends are FIXED and COMPLETE: every event-marker category and every
+# pseudogenization-history category appears on every figure, whether or not it
+# occurs in this gene, in the fixed declaration order of marker_colours /
+# orf_colours. That makes the key identical across genes and across
+# --alignment perform vs defined, so a reader can compare figures directly and
+# can tell "this category is absent here" from "this figure did not list it".
+#
+# Real bug this used to have (reported on PDE6H_ENST00000266395): listing an
+# absent level via limits/drop = FALSE alone produced a LABEL WITH NO SWATCH.
+# ggplot builds each legend key from the layer's data, so a level with no rows
+# draws an empty key -- indistinguishable from a rendering fault, which is
+# exactly how it read. Reproduced minimally on ggplot2 4.0.3.
+#
+# Fix: every scale gets a PHANTOM layer carrying one row per declared level with
+# NA coordinates (na.rm = TRUE). The phantom rows contribute the key glyphs and
+# nothing else -- NA coordinates draw no mark and do not expand the axes -- so
+# every legend entry shows its true colour while the panel is untouched.
 marker_legend_order <- names(marker_colours)
-orf_legend_order <- names(orf_colours)
+
+# `unavailable` ("Sequence unavailable") and `unknown` ("No ancestral sequence")
+# are deliberately NOT listed: requested directly, and they were also the one
+# genuine palette collision (both grey80, so indistinguishable in the key).
+#
+# They stay in orf_colours and in the scale's `limits` on purpose. `unknown` is
+# the FALLBACK orf_class for any orf_transition value missing from
+# orf_display_map, and `unavailable` is what a node with no reconstructed
+# sequence (the clock=0 root) maps to. Dropping them from the scale entirely
+# would put such branches outside its limits, and ggplot would silently DELETE
+# those branches from the tree. Excluding them from `breaks` instead removes
+# them from the legend while keeping every branch drawn; the check below makes
+# sure their use can never pass unnoticed.
+orf_legend_hidden <- c("unavailable", "unknown")
+orf_legend_order <- setdiff(names(orf_colours), orf_legend_hidden)
+orf_present_hidden <- intersect(unique(edge_df$orf_class), orf_legend_hidden)
+if (length(orf_present_hidden) > 0)
+  warning(sum(edge_df$orf_class %in% orf_present_hidden), " branch(es) fall into a history class that ",
+          "is drawn but not shown in the legend (", paste(orf_present_hidden, collapse = ", "),
+          "). They are still plotted in grey.", call. = FALSE)
+
+# One row per level, all coordinates NA. Column names cover both the rect
+# aesthetics (event markers) and the segment aesthetics (branch history).
+phantom_marker <- data.frame(xmin = NA_real_, xmax = NA_real_, ymin = NA_real_, ymax = NA_real_,
+                             marker_class = marker_legend_order, stringsAsFactors = FALSE)
+phantom_orf <- data.frame(x = NA_real_, xend = NA_real_, y = NA_real_, yend = NA_real_,
+                          orf_class = orf_legend_order, stringsAsFactors = FALSE)
+# Scale limits keep EVERY level (see orf_legend_hidden above); only `breaks`
+# is the legend subset, so a hidden-class branch is coloured, not dropped.
+orf_scale_limits <- names(orf_colours)
 
 subtitle <- paste0(nrow(ev), " events on ", length(unique(ev$branch)), " branches; ",
                    sum(ev$shared_event), " shared; ", ntip, " tips; ",
@@ -356,7 +395,13 @@ base_tree <- function(p) {
     # Only the horizontal segment is the evolutionary branch; the vertical one is
     # a drawing connector shared between siblings and must never take a child's colour.
     geom_segment(data = edge_df, aes(x = parent_x, xend = child_x, y = child_y, yend = child_y,
-                                     colour = orf_class), linewidth = 1.0)
+                                     colour = orf_class), linewidth = 1.0) +
+    # Phantom key layer: one NA-coordinate row per declared level, so every
+    # legend entry gets its true colour even when this gene has no such branch.
+    # NA coordinates draw nothing and do not expand the axes (na.rm = TRUE
+    # keeps it silent). See the marker_legend_order comment above.
+    geom_segment(data = phantom_orf, aes(x = x, xend = xend, y = y, yend = yend,
+                                         colour = orf_class), linewidth = 1.0, na.rm = TRUE)
 }
 
 tip_df <- coord[coord$isTip, , drop = FALSE]
@@ -406,6 +451,12 @@ if (nrow(event_nodes) > 0) {
 p1 <- base_tree(ggplot()) +
   geom_rect(data = ev1, aes(xmin = mxmin, xmax = mxmax, ymin = mymin, ymax = mymax, fill = marker_class),
             colour = NA) +
+    # Phantom key layer: one NA-coordinate row per declared level, so every
+    # legend entry gets its true colour even when this gene has no such branch.
+    # NA coordinates draw nothing and do not expand the axes (na.rm = TRUE
+    # keeps it silent). See the marker_legend_order comment above.
+  geom_rect(data = phantom_marker, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax,
+                                       fill = marker_class), colour = NA, na.rm = TRUE) +
   # Fixed offset from the branch's own row for every event, regardless of how
   # many events share that branch (no longer scaled by `rank`): events on one
   # branch are already kept apart along the x-axis via `ex` above, so a
@@ -440,7 +491,7 @@ if (nrow(nostart_df) > 0)
 
 p1 <- p1 +
   scale_colour_manual(name = "Pseudogenization history", values = orf_colours,
-                      breaks = orf_legend_order, limits = orf_legend_order, drop = FALSE,
+                      breaks = orf_legend_order, limits = orf_scale_limits, drop = FALSE,
                       labels = orf_labels[orf_legend_order]) +
   scale_fill_manual(name = "Event marker", values = marker_colours,
                     breaks = marker_legend_order, limits = marker_legend_order, drop = FALSE,
@@ -523,11 +574,18 @@ p2 <- ggplot() +
 p2 <- base_tree(p2) +
   geom_rect(data = ev2, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax,
                             fill = marker_class), colour = NA) +
+    # Phantom key layer: one NA-coordinate row per declared level, so every
+    # legend entry gets its true colour even when this gene has no such branch.
+    # NA coordinates draw nothing and do not expand the axes (na.rm = TRUE
+    # keeps it silent). See the marker_legend_order comment above.
+  geom_rect(data = phantom_marker, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax,
+                                       fill = marker_class), colour = NA, na.rm = TRUE) +
   scale_fill_manual(name = "Event marker", values = marker_colours,
                     breaks = marker_legend_order, limits = marker_legend_order, drop = FALSE,
                     labels = marker_labels[marker_legend_order]) +
   scale_colour_manual(name = "Pseudogenization history", values = orf_colours,
-                      breaks = orf_legend_order, limits = orf_legend_order, drop = FALSE, guide = "none") +
+                      breaks = orf_legend_order, limits = orf_scale_limits, drop = FALSE,
+                      guide = "none") +
   guides(fill = guide_legend(nrow = 3, byrow = TRUE, title.position = "top"))
 # Every internal node, not just event-carrying ones: on a 100+ tip tree the
 # unlabelled backbone made it impossible to tell which branch in the event
