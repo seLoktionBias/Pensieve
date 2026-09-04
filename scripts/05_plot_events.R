@@ -271,7 +271,12 @@ is_ancestral_origin    <- !ev$origin_is_tip
 is_ambiguous_disabling <- (ev$character_class == "stop_mask" & ev$biological_interpretation == "ambiguous_stop_change") |
                           (is_frameshift_indel & ev$biological_interpretation == "ambiguous_indel_change")
 
-ev$marker_class <- "other"
+# A gene can legitimately have NO events to draw -- e.g. every sequence is a
+# complete ORF (nothing broke), or every event was an in-frame indel and this is
+# the no-inframe figure. Assigning a length-1 default into a zero-row data frame
+# is an error in R ("replacement has 1 row, data has 0"), so seed the column at
+# the right length and let the [cond] <- assignments below no-op on logical(0).
+ev$marker_class <- if (nrow(ev) > 0) "other" else character(0)
 ev$marker_class[is_inframe_indel & is_insertion & is_ancestral_origin] <- "shared_inframe_insertion"
 ev$marker_class[is_inframe_indel & is_deletion & is_ancestral_origin]  <- "shared_inframe_deletion"
 ev$marker_class[is_ambiguous_disabling] <- "ambiguous_disabling_candidate"
@@ -535,7 +540,12 @@ short <- (ev2$xmax - ev2$xmin) < min_bar; ev2$xmax[short] <- ev2$xmin[short] + m
 # Greedy sub-lane packing: two events on one branch collide either genuinely
 # (a 1 bp mask inside an insertion) or because a 1 bp bar was widened to stay
 # visible. Overlapping bars go to separate lanes instead of on top of each other.
-pad <- map_w * 0.002; ev2$lane <- 0L; ev2$n_lanes <- 1L
+# Same zero-row guard as marker_class above: a gene can have no events to place
+# (all sequences intact, or every event was an in-frame indel on the no-inframe
+# figure), and assigning a scalar into a 0-row data frame is an R error.
+pad <- map_w * 0.002
+ev2$lane <- if (nrow(ev2) > 0) 0L else integer(0)
+ev2$n_lanes <- if (nrow(ev2) > 0) 1L else integer(0)
 for (yy in unique(ev2$child_y)) {
   idx <- which(ev2$child_y == yy); idx <- idx[order(ev2$xmin[idx])]; lane_end <- numeric(0)
   for (i in idx) {

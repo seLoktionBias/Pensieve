@@ -205,6 +205,29 @@ purge_legacy_reference_artifacts
 mkdir -p "results_00/$GENE" "results_01/$GENE" "results_02/$GENE" "results_03/$GENE" "final_results/$GENE/important_output" "final_results/$GENE/supporting_files"
 
 echo "============================================================"
+# --dated yes only means something if the tree actually carries branch lengths.
+# Asking for it on a cladogram is a harmless mistake, not a reason to fail or to
+# silently produce a meaningless time axis: switch to --dated no, say so loudly,
+# and record it in the run log so the figure's x-axis is never a surprise.
+NOTICE_LOG="logs/${GENE}.run_notices.log"
+if [[ "$DATED" == "yes" ]]; then
+  if ! python - "$TREE" <<'PYEOF'
+import re, sys
+txt = open(sys.argv[1]).read()
+# a branch length is ':' followed by a number, anywhere in the newick
+sys.exit(0 if re.search(r":\s*-?\d", txt) else 1)
+PYEOF
+  then
+    {
+      echo "[$(date)] [NOTICE] --dated yes was requested, but $TREE carries no branch lengths."
+      echo "                  Pensieve switched to --dated no for this run. The figure x-axis is"
+      echo "                  node depth (a cladogram), not time. Supply a tree with branch"
+      echo "                  lengths if you want a real time axis."
+    } | tee -a "$NOTICE_LOG" >&2
+    DATED="no"
+  fi
+fi
+
 echo "Pensieve $(cat "$PROGRAM_DIR/VERSION") | GENE=$GENE | alignment=$ALIGNMENT | dated=$DATED"
 echo "range=$RUN_FROM_STEP->$RUN_UP_TO | tie_break=$TIE_BREAK | min_functional_witnesses=$MIN_FUNCTIONAL_WITNESSES | on_complete_orf_violation=$ON_COMPLETE_ORF_VIOLATION"
 echo "workdir=$WORKDIR | start=$(date)"

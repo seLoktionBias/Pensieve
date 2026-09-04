@@ -39,6 +39,8 @@ install:
 
 test:
 	bash tests/smoke_test.sh
+	python tests/input_validation_test.py
+	bash tests/empty_events_and_dated_test.sh
 
 clean:
 	rm -rf tests/tmp_smoke

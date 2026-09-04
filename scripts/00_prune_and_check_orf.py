@@ -122,6 +122,208 @@ def orf_check(seq):
     }
 
 
+# --------------------------------------------------------------- input checks
+# Every check below either HALTS with an actionable message or records a WARNING
+# and continues. Both go to stderr and to 00_<gene>.input_validation.log so a
+# batch run leaves a readable trail per gene.
+
+PROTEIN_ONLY_LETTERS = set("EFILPQXZJO")
+
+
+def _log(lines, path):
+    path.write_text("\n".join(lines) + "\n")
+
+
+def looks_like_protein(seq):
+    """True if this sequence cannot plausibly be nucleotide.
+
+    Deliberately conservative. IUPAC nucleotide ambiguity codes overlap the
+    amino-acid alphabet (R Y S W K M B D H V N), so those are NOT evidence of
+    protein. Only E F I L P Q X Z J O have no nucleotide meaning at all.
+    """
+    letters = [c for c in seq.upper() if c.isalpha()]
+    if not letters:
+        return False, 0.0, 0
+    nt = sum(1 for c in letters if c in "ACGTUN")
+    prot = sum(1 for c in letters if c in PROTEIN_ONLY_LETTERS)
+    frac_nt = nt / len(letters)
+    return (frac_nt < 0.70 or prot > 0.02 * len(letters)), frac_nt, prot
+
+
+def check_sequences_are_nucleotide(raw_recs, gene, notes):
+    """Halt if the FASTA is protein. clean_seq() keeps only ACGTN-, so a protein
+    FASTA would otherwise be silently shredded into short nonsense instead of
+    failing, and every downstream result would be meaningless."""
+    verdicts = {n: looks_like_protein(s) for n, s in raw_recs.items()}
+    offenders = [(n, f, p) for n, (bad, f, p) in verdicts.items() if bad]
+    if not offenders:
+        return
+    frac = len(offenders) / max(1, len(raw_recs))
+    ex = ", ".join(f"{n} ({f*100:.0f}% ACGTUN)" for n, f, _ in offenders[:5])
+    msg = [
+        f"[ERROR] {gene}: the --fasta file does not look like NUCLEOTIDE sequence.",
+        f"        {len(offenders)} of {len(raw_recs)} sequences ({frac*100:.0f}%) contain amino-acid-only",
+        f"        letters (E F I L P Q X Z J O) and/or too few A/C/G/T/U/N characters.",
+        f"        Examples: {ex}",
+        "",
+        "        Pensieve reconstructs CODING NUCLEOTIDE history: it needs an in-frame CDS",
+        "        nucleotide FASTA, not a protein FASTA. Every step from the codon alignment",
+        "        to codeml and the reading-frame logic assumes nucleotides.",
+        "        Supply the coding nucleotide sequences for these species and re-run.",
+    ]
+    notes.extend(msg)
+    raise SystemExit("\n".join(msg))
+
+
+def load_tree_or_halt(tree_path, gene, notes):
+    """Halt with a readable message if the tree cannot be parsed as Newick."""
+    from Bio import Phylo as _Phylo
+    try:
+        tree = _Phylo.read(tree_path, "newick")
+    except Exception as exc:
+        head = ""
+        try:
+            head = open(tree_path).read(200).replace("\n", " ")[:200]
+        except OSError:
+            head = "(file could not be read)"
+        msg = [
+            f"[ERROR] {gene}: --tree could not be parsed as a Newick tree.",
+            f"        File: {tree_path}",
+            f"        Parser said: {type(exc).__name__}: {exc}",
+            f"        File starts: {head}",
+            "",
+            "        Pensieve needs ONE rooted tree in Newick format, e.g.",
+            "          ((A:0.1,B:0.1):0.2,C:0.3);",
+            "        Common causes: the file is Nexus/PhyloXML rather than Newick, the",
+            "        trailing ';' is missing, parentheses are unbalanced, or the file is",
+            "        empty or contains more than one tree.",
+        ]
+        notes.extend(msg)
+        raise SystemExit("\n".join(msg))
+    if not tree.get_terminals():
+        msg = [f"[ERROR] {gene}: --tree parsed but contains no tip labels.",
+               f"        File: {tree_path}"]
+        notes.extend(msg)
+        raise SystemExit("\n".join(msg))
+    return tree
+
+
+def check_duplicate_fasta_names(pairs, gene, notes):
+    """Halt on repeated FASTA record names.
+
+    Pensieve keys everything by species name. Building a dict from the records
+    would silently keep only the LAST sequence for a repeated name and discard
+    the others with no warning, so this must fail loudly instead."""
+    from collections import Counter
+    counts = Counter(n for n, _ in pairs)
+    dups = sorted([n for n, c in counts.items() if c > 1])
+    if not dups:
+        return
+    detail = ", ".join(f"{n} (x{counts[n]})" for n in dups[:10])
+    msg = [
+        f"[ERROR] {gene}: the --fasta file contains duplicate sequence names.",
+        f"        {len(dups)} name(s) appear more than once, out of {len(counts)} distinct name(s)",
+        f"        across {len(pairs)} records.",
+        f"        Duplicates: {detail}" + (" ..." if len(dups) > 10 else ""),
+        "",
+        "        Pensieve identifies each species by its exact name, so a repeated name is",
+        "        ambiguous: it cannot know which sequence is that species. Keep exactly one",
+        "        record per species (or rename the others) and re-run.",
+        "        Note the name is the header up to the first whitespace, so '>A gene1' and",
+        "        '>A gene2' are BOTH the species 'A'.",
+    ]
+    notes.extend(msg)
+    raise SystemExit("\n".join(msg))
+
+
+def check_tree_file_usable(tree_path, gene, notes):
+    """Halt on an empty or whitespace-only tree file, before the Newick parser
+    turns it into an opaque message."""
+    try:
+        text = open(tree_path).read()
+    except OSError as exc:
+        msg = [f"[ERROR] {gene}: --tree could not be read.",
+               f"        File: {tree_path}", f"        {type(exc).__name__}: {exc}"]
+        notes.extend(msg)
+        raise SystemExit("\n".join(msg))
+    if not text.strip():
+        msg = [
+            f"[ERROR] {gene}: --tree is empty.",
+            f"        File: {tree_path} ({len(text)} byte(s), no non-whitespace content)",
+            "",
+            "        Pensieve needs one rooted Newick tree, e.g.",
+            "          ((A:0.1,B:0.1):0.2,C:0.3);",
+            "        Check the file was written correctly and is not a zero-byte placeholder",
+            "        left behind by a failed export.",
+        ]
+        notes.extend(msg)
+        raise SystemExit("\n".join(msg))
+
+
+def check_duplicate_tree_tips(tree, gene, notes):
+    """Halt on repeated tip labels.
+
+    tree_tips is built as a set, so duplicates would silently collapse and the
+    pruning/ordering logic would then disagree with the real tree shape."""
+    from collections import Counter
+    names = [t.name for t in tree.get_terminals()]
+    counts = Counter(n for n in names if n)
+    dups = sorted([n for n, c in counts.items() if c > 1])
+    unnamed = sum(1 for n in names if not n)
+    if not dups and not unnamed:
+        return
+    msg = [f"[ERROR] {gene}: the --tree has tip labels Pensieve cannot use unambiguously."]
+    if dups:
+        detail = ", ".join(f"{n} (x{counts[n]})" for n in dups[:10])
+        msg += [
+            f"        {len(dups)} tip label(s) appear more than once, out of {len(names)} tips.",
+            f"        Duplicates: {detail}" + (" ..." if len(dups) > 10 else ""),
+            "",
+            "        Each species must be a single tip: a repeated label makes the mapping",
+            "        between sequences and branches ambiguous, and the loss reconstruction",
+            "        would be meaningless. De-duplicate the tree and re-run.",
+        ]
+    if unnamed:
+        msg += [f"        {unnamed} tip(s) have no label at all; every tip must be named."]
+    notes.extend(msg)
+    raise SystemExit("\n".join(msg))
+
+
+def check_species_overlap(fasta_names, tree_tips, gene, notes):
+    """Halt when nothing matches; warn (and continue) when the overlap is thin."""
+    common = fasta_names & tree_tips
+    if not common:
+        fa = ", ".join(sorted(fasta_names)[:5]) or "(none)"
+        tt = ", ".join(sorted(tree_tips)[:5]) or "(none)"
+        msg = [
+            f"[ERROR] {gene}: no species name is shared between the FASTA and the tree.",
+            f"        FASTA has {len(fasta_names)} sequence name(s); tree has {len(tree_tips)} tip label(s);",
+            f"        overlap is 0.",
+            f"        Example FASTA names: {fa}",
+            f"        Example tree tips  : {tt}",
+            "",
+            "        Pensieve matches species by EXACT name. Check for: different separators",
+            "        (Genus_species vs Genus species vs GenusSpecies), extra fields after the",
+            "        name in the FASTA header, differing case, quoted tree labels, or accession",
+            "        numbers on one side only. Make the two label sets identical and re-run.",
+        ]
+        notes.extend(msg)
+        raise SystemExit("\n".join(msg))
+    denom = max(len(fasta_names), len(tree_tips))
+    pct = 100.0 * len(common) / denom
+    if pct < 50.0:
+        notes.extend([
+            f"[WARNING] {gene}: only {len(common)} of {denom} species match between the FASTA",
+            f"          and the tree ({pct:.1f}%, below 50%). Continuing with the {len(common)} shared",
+            f"          species, but the reconstruction rests on a small subset of your data.",
+            f"          FASTA-only: {len(fasta_names - tree_tips)}   tree-only: {len(tree_tips - fasta_names)}",
+            f"          Every dropped species is listed in 00_{gene}.dropped_species.tsv.",
+            f"          If this is unintended it is almost always a name-format mismatch.",
+        ])
+        print("\n".join(notes[-6:]), file=sys.stderr)
+    return common
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gene", required=True)
@@ -138,15 +340,38 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
 
     preserve_width = args.alignment_mode == "defined"
-    recs = {r.id.split()[0]: clean_seq(str(r.seq)) for r in SeqIO.parse(args.fasta, "fasta")}
-    recs = {name: strip_terminal_stop(seq, preserve_width=preserve_width) for name, seq in recs.items()}
-    tree = Phylo.read(args.tree, "newick")
-    tree_tips = {t.name for t in tree.get_terminals()}
-    fasta_names = set(recs)
-    common_set = fasta_names & tree_tips
+    notes = [f"Pensieve input validation for {gene}", "=" * 60]
+    log_path = outdir / f"00_{gene}.input_validation.log"
 
-    if not common_set:
-        raise SystemExit("No matching names between FASTA IDs and tree tip labels.")
+    # Read RAW first: clean_seq() keeps only ACGTN- and would silently shred a
+    # protein FASTA into short nonsense, so the nucleotide check must see the
+    # sequence as the user supplied it.
+    raw_pairs = [(r.id.split()[0], str(r.seq)) for r in SeqIO.parse(args.fasta, "fasta")]
+    raw_recs = dict(raw_pairs)
+    if not raw_recs:
+        msg = [f"[ERROR] {gene}: --fasta contained no sequences.", f"        File: {args.fasta}"]
+        notes.extend(msg); _log(notes, log_path)
+        raise SystemExit("\n".join(msg))
+    try:
+        check_duplicate_fasta_names(raw_pairs, gene, notes)
+        check_sequences_are_nucleotide(raw_recs, gene, notes)
+        check_tree_file_usable(args.tree, gene, notes)
+        tree = load_tree_or_halt(args.tree, gene, notes)
+        check_duplicate_tree_tips(tree, gene, notes)
+        tree_tips = {t.name for t in tree.get_terminals()}
+        fasta_names = set(raw_recs)
+        common_set = check_species_overlap(fasta_names, tree_tips, gene, notes)
+    except SystemExit:
+        _log(notes, log_path)
+        raise
+
+    notes.append(f"[OK] {len(raw_pairs)} FASTA record(s), all names unique.")
+    notes.append(f"[OK] FASTA looks like nucleotide sequence.")
+    notes.append(f"[OK] Tree parsed as Newick ({len(tree_tips)} tips).")
+    notes.append(f"[OK] {len(common_set)} species shared between FASTA and tree.")
+
+    recs = {name: clean_seq(seq) for name, seq in raw_recs.items()}
+    recs = {name: strip_terminal_stop(seq, preserve_width=preserve_width) for name, seq in recs.items()}
 
     dropped = []
     for s in sorted(fasta_names - tree_tips):
@@ -258,6 +483,14 @@ def main():
     write_tsv(failure_rows, outdir / f"00_{gene}.orf_failures.tsv", ["gene", "species", "failure_type", "codon_position", "nt_start", "nt_end", "codon", "details"])
     write_tsv(complete_rows, outdir / f"00_{gene}.complete_orf_species.tsv", ["gene", "species", "sequence_length"])
 
+    notes.append(f"[OK] {len(complete_species)} complete-ORF and {len(incomplete_species)} incomplete-ORF sequence(s).")
+    if not incomplete_species:
+        notes.append(f"[NOTE] every sequence is a complete ORF; MACSE will run with -seq only "
+                     f"(no -seq_lr), and no pseudogenizing events are expected.")
+    if not complete_species:
+        notes.append(f"[NOTE] no sequence has a complete ORF; MACSE will run on the undivided "
+                     f"input with default frameshift costs.")
+    _log(notes, log_path)
     print(f"Finished step00 for {gene}; common species: {len(common)}; "
           f"complete ORFs: {len(complete_species)}; incomplete: {len(incomplete_species)}; "
           f"coordinate system: canonical alignment")
