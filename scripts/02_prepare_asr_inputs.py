@@ -410,6 +410,85 @@ def scan_defined_stops(gene: str, native: Dict[str, str], order: List[str],
     return rows
 
 
+PARTIAL_GAP_HEADER = [
+    "gene", "species", "alignment_start", "alignment_end", "codon_position",
+    "native_codon", "paml_safe_codon", "n_gap_positions", "gap_columns", "interpretation",
+]
+
+
+def scan_codon_grid(gene, native, order, coordinate_system):
+    """v5: find STOPs and partial-codon gaps by walking the ALIGNMENT's own
+    codon grid, and build the PAML-safe view in the same pass.
+
+    For each sequence, in chunks of three alignment columns:
+
+      * chunk is TAA/TAG/TGA   -> PAML view gets NNN; recorded as a premature
+                                  STOP (a terminal codon is flagged, not called).
+      * chunk holds 1 or 2 '-' -> only those '-' become 'N' (C-A -> CNA,
+                                  T-- -> TNN), so codeml never sees a partial
+                                  codon. Recorded so the gap can be reintroduced.
+      * chunk is '---'         -> untouched; a wholly deleted codon is ordinary
+                                  missing data to codeml.
+      * anything else          -> untouched.
+
+    Everything is expressed in canonical alignment columns, so no raw-sequence
+    coordinate mapping happens anywhere. That is the point: the alignment grid
+    IS the reading frame events are called in.
+    """
+    length = len(next(iter(native.values())))
+    paml, stop_rows, gap_rows = {}, [], []
+    last_codon_start = length - 3
+    for species in order:
+        seq = native[species].upper()
+        out = list(seq)
+        for k in range(0, length, 3):
+            chunk = seq[k:k + 3]
+            start, end = k + 1, k + 3
+            if chunk in STOPS:
+                out[k:k + 3] = list("NNN")
+                is_terminal = k == last_codon_start
+                stop_rows.append({
+                    "gene": gene, "species": species, "codon_position": k // 3 + 1,
+                    "nt_start": "NA", "nt_end": "NA",
+                    "primary_alignment_start": start, "primary_alignment_end": end,
+                    "stop_codon": chunk, "corrected_homologous_codon": chunk,
+                    "coordinate_system": coordinate_system,
+                    "terminal_codon": is_terminal,
+                    "pseudogenizing_event_candidate": (not is_terminal),
+                    "independent_stop_candidate": (not is_terminal),
+                    "mapped_columns_contiguous": True,
+                    "codon_frame_aligned": True,
+                    "codon_confirmed_stop": True,
+                    "frame_shifted_at_stop": False,
+                    "upstream_macse_marker_count": "NA",
+                    "upstream_macse_frame_correction_mod3": "NA",
+                    "stop_phase_interpretation": "alignment_codon_grid_scan",
+                    "reason": ("terminal_stop_masked_for_paml_only" if is_terminal
+                               else "alignment_grid_inframe_stop_masked_as_independent_candidate"),
+                    "stop_event_key": f"{start}-{end}:{chunk}",
+                })
+                continue
+            n_gap = chunk.count("-")
+            if 0 < n_gap < 3:
+                cols = []
+                for j in range(3):
+                    if chunk[j] == "-":
+                        out[k + j] = "N"
+                        cols.append(k + j + 1)
+                gap_rows.append({
+                    "gene": gene, "species": species,
+                    "alignment_start": start, "alignment_end": end,
+                    "codon_position": k // 3 + 1,
+                    "native_codon": chunk,
+                    "paml_safe_codon": "".join(out[k:k + 3]),
+                    "n_gap_positions": n_gap,
+                    "gap_columns": ",".join(str(c) for c in cols),
+                    "interpretation": "partial_codon_gap_filled_with_N_for_paml_only",
+                })
+        paml[species] = "".join(out)
+    return paml, stop_rows, gap_rows
+
+
 def mask_paml_stops(paml: Dict[str, str], order: List[str], registry: List[dict],
                     gene: str, coordinate_system: str) -> Tuple[Dict[str, str], List[dict]]:
     """Mask exact aligned stop codons but retain a complete audit trail."""
@@ -626,8 +705,12 @@ def main() -> None:
             )
         validate_equal_alignment(macse, order, ALLOWED_MACSE, "MACSE alignment")
         canonical_source = {name: macse[name] for name in order}
-        native = {name: macse[name].replace("!", "-") for name in order}
-        paml_pre = {name: macse[name].replace("!", "N") for name in order}
+        # v5: every MACSE-specific character (the '!' partial-codon placeholder,
+        # and anything else outside ACGTN) becomes an ordinary gap. From here on
+        # the alignment is treated exactly like a user-defined one.
+        native = {name: "".join(c if c in "ACGTN-" else "-" for c in macse[name].upper())
+                  for name in order}
+        paml_pre = dict(native)
         coordinate_system = "macse_codon_alignment"
         source_path = r1 / canonical_nt_name
     else:
@@ -657,17 +740,14 @@ def main() -> None:
                                     input_seqs, out, coordinate_system,
                                     on_violation=args.on_complete_orf_violation)
 
-    if args.alignment_mode == "perform":
-        # MACSE ran: join raw STOP calls to MACSE frame-phase diagnostics and
-        # remap them into canonical coordinates through the four validation gates.
-        raw_stops = load_raw_stop_diagnostics(r0, r1, gene)
-        stop_registry = build_stop_registry(gene, raw_stops, canonical_source, user, coordinate_system)
-    else:
-        # --alignment defined: no MACSE. Read premature stops straight off the
-        # authoritative codon alignment (see scan_defined_stops).
-        stop_registry = scan_defined_stops(gene, native, order, coordinate_system)
-    paml_safe, technical_stops = mask_paml_stops(paml_pre, order, stop_registry, gene, coordinate_system)
-    all_stops = stop_registry + technical_stops
+    # v5: identical treatment for both alignment modes. Every STOP and every
+    # partial-codon gap is found on the alignment's own codon grid and the
+    # PAML-safe view is built in the same pass. No raw-sequence STOP scan, no
+    # raw->alignment coordinate mapping, and no unconditional second masking
+    # pass over rejected spans.
+    paml_safe, stop_registry, partial_gap_rows = scan_codon_grid(
+        gene, native, order, coordinate_system)
+    all_stops = stop_registry
 
     # Diagnostic record of MACSE frame-restoration placeholders.  The row states
     # deliberately avoid claiming insertion/deletion direction.
@@ -697,6 +777,8 @@ def main() -> None:
         "mapped_columns_contiguous", "codon_frame_aligned", "codon_confirmed_stop", "frame_shifted_at_stop", "upstream_macse_marker_count",
         "upstream_macse_frame_correction_mod3", "stop_phase_interpretation", "reason", "stop_event_key",
     ])
+    write_tsv(partial_gap_rows,
+              out / f"02_{gene}.masked_partial_codon_gaps.tsv", PARTIAL_GAP_HEADER)
     write_tsv(frame_rows, out / f"02_{gene}.macse_frameshift_placeholders.tsv", [
         "gene", "species", "alignment_column", "source_character", "native_character",
         "paml_safe_character", "interpretation",
@@ -712,7 +794,7 @@ def main() -> None:
         "defined_alignment_columns_modified": False,
         "second_alignment_performed": False,
         "premature_stop_detection": (
-            "macse_raw_stop_remap_with_four_gates" if args.alignment_mode == "perform"
+            "alignment_codon_grid_scan" if args.alignment_mode == "perform"
             else "direct_codon_frame_scan_of_defined_alignment_no_macse"
         ),
         "paml_stop_masking": "exact STOPs -> NNN; premature STOP alignment coordinates retained",

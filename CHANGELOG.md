@@ -1,5 +1,97 @@
 # Changelog
 
+## v5.0 - STOPs and partial codons are found on the alignment's own codon grid; the raw-sequence STOP path is retired
+
+Reported from real data: on the eight bat visual genes, `--alignment perform`
+reported **11** premature-STOP events where the corrected code reports **490**.
+CNGA3 and GUCA1C reported none at all. Two independent defects in the
+raw-sequence STOP path were responsible, and the split between the two alignment
+modes made them disagree for reasons unrelated to the biology.
+
+### Root cause 1: raw STOP coordinates were mapped through a gapped sequence
+- `00_prune_and_check_orf.py` records `nt_start` for every `premature_in_frame_stop`
+  on the RAW, gap-stripped sequence (it stamps `details="raw_unaligned_sequence"`).
+- `02_prepare_asr_inputs.py` nevertheless handed `build_stop_registry()` the row
+  from `00_<gene>.common_species.fasta`, which retains the user's gaps. When the
+  supplied FASTA is itself an alignment, `build_raw_to_alignment_map()` therefore
+  matched a gapped string against a gapped string and returned a near-identity
+  map. Real STOPs were then looked up at the wrong columns, read as non-STOPs,
+  and discarded via `raw_premature_stop_corrected_homologous_codon_is_not_a_stop`.
+- Invisible with gapless input, because there the two strings coincide.
+- Confirmed on PDE6H/Desmodus_rotundus: raw codon 51 (nt 151-153, TGA) was
+  recorded at columns 151-153, where the alignment reads `GAT`. Its true position
+  is columns 160-162, shared with Diaemus_youngii.
+
+### Root cause 2: rejected STOP spans were still N-masked
+- After masking exact on-grid STOP codons, `mask_paml_stops()` looped over the
+  WHOLE registry and masked every mapped span, with no filter on
+  `pseudogenizing_event_candidate` or on the rejection reason -- including spans
+  rejected as frameshift consequences or as off-grid.
+- That loop can never prevent a STOP reaching codeml: simulating the first scan
+  alone leaves zero on-grid STOPs in all eight genes. Its only effect was to
+  replace real substitution evidence with `N`. Measured: 21,039 bases masked, of
+  which **18,573 (88%) were collateral** -- the containing codon was not a STOP --
+  and 11,735 codons were left partially masked, corrupting two legitimate codons
+  at a time.
+
+### The replacement: `scan_codon_grid()`
+Both alignment modes now run identical code from step 02 onward. Each sequence is
+walked in chunks of three alignment columns:
+
+| chunk | PAML-safe view | recorded |
+|---|---|---|
+| `TAA`/`TAG`/`TGA` | `NNN` | premature STOP; a terminal codon is flagged, not called |
+| 1-2 `-` (`C-A`, `T--`, `-A-`) | only the gaps become `N` (`CNA`, `TNN`, `NAN`) | partial-codon gap, with exact columns |
+| `---` | untouched | - |
+| anything else | untouched | - |
+
+Everything is expressed in canonical alignment columns, so no raw-to-alignment
+coordinate mapping happens anywhere -- the class of bug behind root cause 1 no
+longer has a code path to live in. New output
+`02_<gene>.masked_partial_codon_gaps.tsv` records every masked gap so it can be
+reintroduced. In `--alignment perform`, every character outside `ACGTN` (MACSE's
+`!` placeholder and anything else) becomes an ordinary gap first, after which the
+MACSE alignment is treated exactly like a user-defined one.
+
+`build_stop_registry()`, `scan_defined_stops()`, `load_raw_stop_diagnostics()` and
+`mask_paml_stops()` are no longer referenced by the pipeline. They are retained
+for now because `tests/backend_consistency_test.py` exercises their helpers
+directly.
+
+### Two figure pairs
+`run_one_gene_00_to_04.sh` now renders the event map and pseudogenization tree
+twice: once with every event, and once as `<GENE>.*.no_inframe.{pdf,png}` with
+in-frame indels removed, leaving only frameshift indels and pseudogenizing
+events. New helper `scripts/05b_filter_inframe_events.py` applies exactly
+`05_plot_events.R`'s own `is_inframe_indel` test, so the two never disagree.
+
+### Verified on eight bat visual genes (103-111 species, 279-6357 bp)
+- PAML-safe view invariants across all eight: **0** STOP codons remain, **0**
+  partial codons remain, **0** wholly-gapped codons altered. Total `N` fell from
+  21,039 to **5,125 (0.39% of real bases)**.
+- Indel events are **byte-identical** to the previous release (3,161 in both), so
+  nothing about indel inference changed.
+- Premature-STOP events 249 -> 490, of which shared/ancestral 72 -> **114**.
+- PDE6H columns 160-162 (`TGA`, Desmodus_rotundus + Diaemus_youngii) is now one
+  shared event on their ancestral branch, matching an independent run of the same
+  gene built from gapless input.
+- CNGA3 columns 190-192 (`TAA`) is one shared event on the stem of
+  Glossophaga + Leptonycteris; the previous release reported no CNGA3 STOP events.
+- Full test suite passes: backend consistency, functional shared indels,
+  ORF-aware parsimony, PAML exit/reference-free, reliable split and ORF gate,
+  plot smoke, pipeline smoke.
+
+### Known limitation
+376 of the 490 STOP events are lineage-specific singletons, and 87 STOP characters
+require more than one independent origin (mostly GUCY2F). These are substitutions
+accumulating in already-pseudogenic lineages -- their branches are scored
+`already_pseudogenic` rather than `pseudogenization`, so they are recorded without
+being claimed as causes -- but the homoplasy is worth inspecting per gene. A
+future option would be to suppress STOP events on branches already scored
+`already_pseudogenic`.
+
+### VERSION bumped to 5.0.
+
 ## v4.9 - the complete-ORF gate warns by default and marks the species on the figures; no-complete-ORF genes no longer crash
 
 Requested directly, after v4.8 landed.

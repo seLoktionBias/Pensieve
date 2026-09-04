@@ -2,18 +2,20 @@
 
 **Reconstruct where and when a gene broke.**
 
-Pensieve is a gene-centred workflow for reconstructing **where coding-sequence lesions arose on a rooted species tree**. It combines a frameshift-aware MACSE alignment, PAML `codeml` ancestral nucleotide reconstruction, and its own parsimony-based event/history engine to answer, for any coding gene and any rooted tree of species: *which lineage lost this gene first, is the loss shared or independent, and what exactly broke it (a premature stop, a frameshifting indel, or something ambiguous)?* The result is a fully reconstructed ancestral sequence at every internal node and two publication-ready figures per gene.
+Pensieve is a gene-centred workflow for reconstructing **where coding-sequence lesions arose on a rooted species tree**. It combines a frameshift-aware MACSE alignment, PAML `codeml` ancestral nucleotide reconstruction, and its own parsimony-based event/history engine to answer, for any coding gene and any rooted tree of species: *which lineage lost this gene first, is the loss shared or independent, and what exactly broke it (a premature stop, a frameshifting indel, or something ambiguous)?* The result is a fully reconstructed ancestral sequence at every internal node and two pairs of publication-ready figures per gene.
 
-v3.31 made installation/execution portable across local machines and HPC systems (no assumption of Miniforge, mamba, or any site-specific module command); every release since has kept that portability while fixing real bugs found by running Pensieve on real genomes, listed in full in [`CHANGELOG.md`](CHANGELOG.md). The current release is **v4.9** (see `VERSION`).
+v3.31 made installation/execution portable across local machines and HPC systems (no assumption of Miniforge, mamba, or any site-specific module command); every release since has kept that portability while fixing real bugs found by running Pensieve on real genomes, listed in full in [`CHANGELOG.md`](CHANGELOG.md). The current release is **v5.0** (see `VERSION`).
 
-**Recent highlights (v4.3–v4.9):**
+**Recent highlights (v4.3–v5.0):**
+
+- **STOPs and partial codons are found on the alignment's own codon grid (v5.0).** Each sequence is walked in chunks of three alignment columns: an exact `TAA`/`TAG`/`TGA` is masked to `NNN` and recorded as a premature STOP; a codon holding one or two gaps has *only* those gaps filled with `N` (`C-A` → `CNA`, `T--` → `TNN`) so codeml never sees a partial codon; a wholly gapped `---` codon is left alone. Every coordinate is a canonical alignment column, so the raw-sequence STOP scan and the raw→alignment coordinate mapping are **gone** — with them, two real defects (see `CHANGELOG.md` v5.0). `--alignment perform` and `--alignment defined` now share one code path from step 02 onward.
 
 - **Three-way ORF status.** Every tip and every reconstructed ancestor is classified as **intact** (complete ORF), **pseudogenized/disrupted** (an in-frame premature stop or an *internal* frameshift indel), or **partial** (incomplete — missing ATG and/or length not a multiple of three and/or truncated — but with no premature stop and no internal frameshift). Incompleteness alone is never treated as evidence of pseudogenization; partial branches are drawn orange.
 - **Functional-shared ancestral indels, decided before reconstruction** (`--min-functional-witnesses`, default 2). A pre-pass in the `diagnostics` stage compares, for every indel, which functional (complete-ORF) lineages carry it against which pseudogenized ones, and records the verdict in `01b_<GENE>.functional_shared_indels.tsv`. An indel that the functional lineages **share** — carried by at least two phylogenetically independent functional lineages *and* by strictly more functional lineages than definitely lack it — is fixed as ancestral rather than reconstructed as an implausible convergent gain on each lineage. Pseudogenized lineages are not equivalent witnesses: a dead gene accumulates arbitrary indels, so their agreement alone never makes an indel ancestral.
 - **Direction-aware event merging.** Fragments of one real indel on one branch are merged by what happened (`indel_gain`/`indel_loss`), not by the printed confidence label, and are merged across columns that were already gap in both the parent and the child — an indel is defined relative to the parent's sequence. The merged event's length is the material actually gained or lost, so the frame effect stays correct.
 - **MACSE is told which sequences it may trust.** Step 00 splits the gapless CDS by ORF completeness into `complete_seqs.fa` / `incomplete_seqs.fa`; step 01 runs `macse -seq complete_seqs.fa -seq_lr incomplete_seqs.fa -fs 1000 -fs_term 1000`, so a frameshift inside a complete ORF is prohibitively expensive while the real lesions in the pseudogenized set stay cheap. This replaces the conserved 5′ start-block heuristic, which is **removed** — it only ever checked the first 30 codons.
 - **A pre-PAML gate on the complete ORFs.** Before anything reaches PAML, every complete ORF must reproduce its input sequence exactly after degapping, carry zero MACSE `!` markers, and occupy only whole codon cells (three residues or `---`). `--on-complete-orf-violation warn` (default) reports the violation, marks those species with a trailing `*` on both figures, and continues; `stop` aborts instead. Either way `02_<GENE>.complete_orf_alignment_validation.tsv` records every species.
-- **`--alignment defined` runs with no MACSE**, reading premature stops directly off the supplied codon frame; `scripts/prepare_defined_alignment.py` is an opt-in helper to make an off-frame curated alignment ready (assembly-gap masking + trailing all-gap trim).
+- **`--alignment defined` runs with no MACSE**; from step 02 onward it is treated identically to `--alignment perform`. `scripts/prepare_defined_alignment.py` is an opt-in helper to make an off-frame curated alignment ready (assembly-gap masking + trailing all-gap trim).
 - **Clearer figures.** A red **×** marks any tip whose CDS lacks an ATG start codon; frameshift insertions and deletions are coloured separately; terminal (5′/3′) indels are drawn as non-disabling; and figure legends are now **fixed and complete**, so they are identical and directly comparable across genes and between `--alignment perform` and `--alignment defined`.
 - **IndelMaP has been removed** entirely; the core PAML+Pensieve inference is unchanged.
 
@@ -70,7 +72,7 @@ For submitting Pensieve itself as a Slurm **batch** job (rather than working int
 
 ## Example output
 
-Every gene run produces two figures. Below are both, from a real 103-species bat run of **CNGA3** (a gene with several independent and shared pseudogenization events — a good example of the kind of history Pensieve is designed to resolve).
+Every gene run produces **two pairs** of figures. Below are the two views, from a real 103-species bat run of **CNGA3** (a gene with several independent and shared pseudogenization events — a good example of the kind of history Pensieve is designed to resolve).
 
 **`<GENE>.pseudogenization_tree.pdf`** — the headline figure. Branches are coloured by reconstructed ORF history: grey where the gene stayed intact, saturated red on the branch where it was first confidently disabled, pale red on every descendant branch that inherited that loss, and amber where the reconstruction is genuinely ambiguous. Species names in red are pseudogenized. Small boxed labels on branches show each event's alignment start position (above) and length (below).
 
@@ -81,6 +83,8 @@ Every gene run produces two figures. Below are both, from a real 103-species bat
 ![CNGA3 event map](docs/images/CNGA3.event_map.png)
 
 Both are written as paired PDF (vector, for publication) and PNG (for quick viewing/embedding) to `final_results/<GENE>/important_output/`.
+
+Each is rendered **twice**: once with every reconstructed event, and once as `<GENE>.pseudogenization_tree.no_inframe.*` / `<GENE>.event_map.no_inframe.*` with in-frame (non-disrupting) indels removed — both the shared-ancestral ones and the lineage-specific ones — leaving only frameshift indels and pseudogenizing events. On a large gene the in-frame indels are typically 45–90% of all events, so the second pair is usually the readable one; the first keeps the complete record.
 
 ## Reference-free design
 
@@ -262,7 +266,7 @@ pensieve ... --mode slurm --env-mode conda --slurm-module YOUR_SITE_MODULE
 
 MACSE's own nucleotide alignment is the single canonical coordinate system; MACSE is the only alignment engine Pensieve uses anywhere in the pipeline.
 
-A short, highly conserved stretch at the very start of the gene is checked separately first: if MACSE's own edit there does not clearly improve on a species' own real sequence, MACSE's edit is set aside in favor of that species' real sequence, so a lesion elsewhere in the gene can no longer disturb the start of the gene for anyone. This avoids a real failure mode where one broken (pseudogenized) sequence caused MACSE to introduce a spurious gap into the start codon of every other, perfectly intact species in the same alignment (real PDE6C data). In the rare case an accepted block edit leaves candidates of differing length, MACSE itself realigns just that block -- never a second tool.
+Step 00 splits the gapless CDS by ORF completeness and step 01 runs `macse -seq complete_seqs.fa -seq_lr incomplete_seqs.fa -fs 1000 -fs_term 1000`, so a frameshift inside a complete ORF is prohibitively expensive while real lesions in the pseudogenized set stay cheap. (The conserved 5′ start-block heuristic this section used to describe was **removed in v4.8**; declaring reliability up front replaced repairing MACSE's output afterwards.)
 
 Two synchronized FASTAs contain the same columns:
 
@@ -290,12 +294,14 @@ If those requirements are not met, Pensieve fails rather than silently changing 
 
 A MACSE `!` is a **partial-codon/frame-restoration placeholder**, not intrinsically a one-base deletion.
 
-v3.31 therefore uses:
+From v5.0 every character outside `ACGTN` — the `!` placeholder and anything else MACSE emits — becomes an ordinary gap in **both** views:
 
 ```text
 native structural view: ! -> -
-PAML-safe view:         ! -> N
+PAML-safe view:         ! -> -   (then the codon-grid scan below fills partial codons with N)
 ```
+
+Earlier releases wrote `! -> N` directly into the PAML-safe view. That is now done by the codon-grid scan instead, which fills a partial codon's gaps whether they came from a `!` or from an ordinary alignment gap — so the two are treated identically and the PAML view can never contain a partial codon.
 
 Removing `!` as a placeholder in the native view does **not** assign event direction. Insertion/deletion direction is inferred later from the complete residue/gap pattern and the rooted tree.
 
@@ -303,13 +309,22 @@ This is important for patterns in which `!!N` can be associated with an underlyi
 
 ## Premature STOP handling
 
-Raw in-frame premature STOPs are recorded before PAML masking, mapped onto canonical alignment coordinates, and retained with the exact allele (`TAA`, `TAG` or `TGA`).
+Premature STOPs are found **on the canonical alignment's own codon grid** (v5.0), in the same pass that builds the PAML-safe view. For each sequence, in chunks of three alignment columns:
 
-The PAML-safe alignment masks exact STOP codons to `NNN`, while the native view retains the observed allele.
+| chunk | PAML-safe view | recorded |
+|---|---|---|
+| `TAA` / `TAG` / `TGA` | `NNN` | premature STOP; a terminal codon is flagged, not called |
+| one or two `-` (`C-A`, `T--`, `-A-`) | only those gaps become `N` (`CNA`, `TNN`, `NAN`) | partial-codon gap, with the exact columns |
+| `---` | untouched | — |
+| anything else | untouched | — |
+
+The native view retains the observed allele throughout, and every masked gap is recorded in `02_<GENE>.masked_partial_codon_gaps.tsv` so it can be reintroduced after codeml.
 
 Different STOP alleles at the same aligned codon are separate characters. A TGA and a TAA at the same location are not automatically called the same mutation.
 
-A raw stop is classified using the **MACSE frame phase at that exact position**, not merely the existence of any earlier `!` marker. Pensieve sums upstream MACSE partial-codon correction lengths modulo three. If the phase is still shifted, the STOP is retained as a likely frameshift consequence; if compensating frameshifts restore phase (`mod 3 = 0`), the STOP remains eligible as an independent nonsense-mutation character.
+**Why the grid, and not the raw sequence.** Up to v4.9 STOPs were scanned on the raw, unaligned CDS and then mapped forward into alignment coordinates through four validation gates. Two defects lived in that path — coordinates mapped through a gapped sequence, and rejected spans still `N`-masked (`CHANGELOG.md`, v5.0) — and it made the two alignment modes disagree for non-biological reasons. Reading the grid directly removes the mapping step entirely, so that class of error has nowhere left to occur.
+
+One consequence is worth understanding. A lineage carrying an upstream frameshift reads its *own* sequence out of phase, and the stop codons it appears to contain in that shifted frame are consequences of the one frameshift, not independent nonsense mutations. Those stops are simply not on the alignment grid, so the scan never sees them. What the scan does see is what changed relative to the **ancestral** reading frame the alignment encodes — which is the right question when the goal is dating lesions to branches rather than cataloguing whatever stop codons a broken sequence happens to contain today.
 
 ## Breakpoint event logic
 
@@ -510,10 +525,13 @@ intact
 
 Descendants of the same pseudogenization event share one evolutionary history after the gene died — they are not independent evidence about whether that loss happened, or when. Before reconstructing an individual indel or premature-stop change, Pensieve first builds a rough, sequence-only map of which parts of the tree are functional versus pseudogenic, then bounds how much influence a whole pseudogenic branch of the tree — however many species it contains — can have on the ancestor **above** it (the message that crosses the loss boundary going further up the tree). A clade sampled with 20 species carries about the same weight there as the same clade sampled with 2-3 species would. Mutations that happened *after* the gene broke are still fully reconstructed and reported; the component's own entry node (where the loss itself is placed) and everything inside the component always keep full, unbounded evidence — only the pull on ancestors *above* the loss is capped (v4.2; an earlier v4.0/v4.1 version of this correction also capped the entry node's own state, which was stronger than necessary and could overwrite real internal evidence). `03_<GENE>.provisional_orf_history.tsv` and `03_<GENE>.pseudogenic_components.tsv` record this intermediate map for inspection.
 
-### A raw premature stop must survive its own frame correction to count
+### STOPs are read in the alignment's frame, not each sequence's own frame
 
-A single early frameshift can make a raw, unaligned sequence read many downstream premature stop codons in the shifted frame — those stops are consequences of the one frameshift, not independent nonsense mutations, and disappear as soon as that frameshift is corrected. Before a raw premature stop can found a phylogenetic character, Pensieve requires four things to hold simultaneously: the cumulative upstream MACSE frame correction is zero at that exact position (the frame is not shifted there), its three raw nucleotides map to three consecutive columns of the final canonical alignment (no placeholder wedged inside the codon), that mapped span actually starts on a real codon boundary of the alignment's own shared codon frame (not just any three consecutive columns — a raw-frame stop position can land on a column that only *looks* like a codon start once an earlier correction has shifted the column numbering, even when the frame-correction check above already passed), and the actual homologous codon read back from that final alignment is still exactly TAA/TAG/TGA. A stop that fails any of these is kept in the diagnostic registry (`02_<GENE>.masked_inframe_premature_stops_after_macse_correction.tsv`, `reason` column) but never enters parsimony or the event plot, and a tip whose own occurrence fails validation is never counted as carrying some other, independently-validated tip's stop character merely because its alignment segment spells the same codon.
+A single early frameshift makes a raw, unaligned sequence read many downstream premature stop codons in its shifted frame. Those stops are consequences of the one frameshift, not independent nonsense mutations, and they disappear the moment the frameshift is corrected.
 
+Up to v4.9 Pensieve guarded against this with four gates on a raw-scanned stop (frame phase, contiguous mapping, codon-boundary alignment, and the corrected codon still being a stop). From v5.0 the guard is structural rather than procedural: STOPs are only ever read off the canonical alignment's shared codon grid, so a stop that exists purely in one sequence's shifted frame is never a candidate in the first place.
+
+`02_<GENE>.masked_inframe_premature_stops_after_macse_correction.tsv` still records every STOP the scan found, with its alignment columns, allele and whether it was terminal.
 
 ## Safe handling of codeml joint-reconstruction failures
 
@@ -602,8 +620,12 @@ GENE.ancestral_integrated_alignment.fa         # same phylogenetic row order
 GENE.ancestral_native_cds.fa                   # same phylogenetic row order
 GENE.pensieve_tree.nwk
 GENE.internode_label_crosswalk.tsv
-GENE.pseudogenization_tree.pdf/.png
-GENE.event_map.pdf/.png
+GENE.pseudogenization_tree.pdf/.png             # all events
+GENE.event_map.pdf/.png                        # all events
+GENE.pseudogenization_tree.no_inframe.pdf/.png # frameshift indels + pseudogenizing events only
+GENE.event_map.no_inframe.pdf/.png             # frameshift indels + pseudogenizing events only
+GENE.plotted_events.no_inframe.tsv             # exactly what the second pair draws
+GENE.masked_partial_codon_gaps.tsv             # (supporting_files) gaps filled with N for codeml
 ```
 
 The stage directories retain the more detailed state tables and audit files.
@@ -631,7 +653,7 @@ The v3.31 smoke suite includes synthetic tests for:
 - separate TAA/TGA event identity;
 - non-alphabetical rooted-tree ordering of tip MSAs and combined tip+internode MSAs;
 - frameshift-only taxa without a premature-STOP gate;
-- PAML-safe STOP masking with native STOP retention;
+- PAML-safe STOP masking with native STOP retention, and the v5.0 codon-grid invariants (no STOP and no partial codon survives into the codeml input, and a wholly gapped codon is never altered);
 - `--alignment defined` column preservation;
 - mock PAML internal-node mapping and non-fabricated root handling;
 - sticky pseudogenic history after an apparent compensatory restoration.
