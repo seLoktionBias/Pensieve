@@ -1,5 +1,43 @@
 # Changelog
 
+## v5.01 - version identity made consistent across every file; supersedes the v5.0 release artefact
+
+v5.0 shipped with an inconsistent version identity. `VERSION` said `5.0`, but
+`bin/pensieve`'s long help still printed `Pensieve v4.9 - full manual`, and both
+`tests/backend_consistency_test.py` and `tests/smoke_test.sh` still asserted
+`4.9` -- so the test suite **failed** on the released tree
+(`FAIL VERSION is 4.9`). Separately, the v5.0 release tag was cut before the
+`--complete-orf-validation` runner guard was merged, so the downloadable v5.0
+archive and a fresh clone of `main` were not the same code.
+
+v5.01 makes the version identity consistent everywhere it is declared and is cut
+from a tree where the full suite passes, so a download and a clone are identical.
+
+### Changed
+- `VERSION` -> `5.01`.
+- `bin/pensieve`: long-help banner now reads `Pensieve v5.01 - full manual`.
+- `tests/backend_consistency_test.py`: asserts `VERSION == "5.01"` and that the
+  long help reports v5.01.
+- `tests/smoke_test.sh`: greps for the v5.01 banner.
+- `README.md`: current release v5.01.
+
+### Included from v5.0 and the follow-up fix
+- The alignment codon-grid STOP/partial-codon scan and the retirement of the
+  raw-sequence STOP path (see the v5.0 entry below) -- unchanged.
+- The `--complete-orf-validation` runner guard, which merged after the v5.0 tag
+  was cut and was therefore absent from the v5.0 download.
+
+### Tests
+Full suite passes on this tree: backend consistency, functional shared indels,
+ORF-aware parsimony, PAML exit/reference-free, reliable split and ORF gate, plot
+smoke, pipeline smoke.
+
+### Note on version references in prose
+`README.md` and the entry below still attribute the codon-grid design to **v5.0**,
+which is where that code landed. Only the *declared current version* is v5.01.
+
+### VERSION bumped to 5.01.
+
 ## v5.0 - STOPs and partial codons are found on the alignment's own codon grid; the raw-sequence STOP path is retired
 
 Reported from real data: on the eight bat visual genes, `--alignment perform`
