@@ -288,12 +288,23 @@ if step_in_range plot; then
   if [[ "$SKIP_PLOT" -eq 0 ]]; then
     echo "[$(date)] STEP plot: history-aware tree and event map"
     ALN_LEN="$(awk 'NR==1{print $2}' "results_02/$GENE/02_${GENE}.codon_for_paml.phy")"
+    # The complete-ORF validation report only exists for workdirs whose step 02
+    # was run by v4.8 or later. Re-plotting an older workdir (--run_from_step
+    # plot) must not die just because that file predates the gate, and
+    # 05_plot_events.R stops hard on a --complete-orf-validation path that does
+    # not exist -- so the flag is only passed when the report is actually there.
+    CORF_ARGS=()
+    if [[ -s "results_02/$GENE/02_${GENE}.complete_orf_alignment_validation.tsv" ]]; then
+      CORF_ARGS=(--complete-orf-validation "results_02/$GENE/02_${GENE}.complete_orf_alignment_validation.tsv")
+    else
+      echo "[INFO] No complete-ORF validation report for $GENE (pre-v4.8 workdir); plotting without '*' marks."
+    fi
     Rscript "$SCRIPT_DIR/05_plot_events.R" --gene "$GENE" \
       --tree "results_03/$GENE/03_${GENE}.pensieve_labelled_dated_tree.nwk" \
       --events "results_03/$GENE/03_${GENE}.alignment_events.tsv" \
       --orf-transitions "results_03/$GENE/04_${GENE}.orf_transitions_by_branch.tsv" \
       --orf-status "results_00/$GENE/00_${GENE}.orf_status.tsv" \
-      --complete-orf-validation "results_02/$GENE/02_${GENE}.complete_orf_alignment_validation.tsv" \
+      "${CORF_ARGS[@]}" \
       --alignment-length "$ALN_LEN" \
       --outdir "final_results/$GENE/important_output" --dated "$DATED"
     require_file "final_results/$GENE/important_output/${GENE}.pseudogenization_tree.pdf" plot_pdf
