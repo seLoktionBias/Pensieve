@@ -1,5 +1,77 @@
 # Changelog
 
+## v5.02 - input validation that fails loudly, and two zero-row plot crashes fixed
+
+Four bugs, all reachable from ordinary user mistakes, found by running Pensieve
+against deliberately malformed inputs.
+
+### Silent data loss (pre-existing, the most serious of the four)
+- **Duplicate FASTA record names** were collapsed by a dict comprehension
+  (`{r.id: seq for r in ...}`), so every repeat but the last was discarded with
+  no warning. The run then completed normally and produced a confident-looking
+  result built on fewer sequences than the user supplied.
+- **Duplicate tree tip labels** were collapsed by a set (`{t.name for t in ...}`)
+  in exactly the same way, leaving the pruning and ordering logic disagreeing
+  with the real shape of the tree.
+
+Both now halt and name the offending labels with their counts. The FASTA message
+also points out that the name is the header up to the first whitespace, so
+`>A gene1` and `>A gene2` are both the species `A`.
+
+### Crashes after the analysis was already complete (introduced in v5.0)
+- `05_plot_events.R` assigned scalar defaults into a **zero-row** data frame --
+  first `marker_class`, then `lane` / `n_lanes` -- producing
+  `replacement has 1 row, data has 0` and aborting the run at the very last step,
+  with every result already written. Any gene with no events to draw hit this.
+  The natural trigger is a gene in which every sequence is a complete ORF:
+  nothing broke, so nothing survives the in-frame filter for the second figure.
+- Both are guarded. Such a gene now renders a correct figure reading
+  `0 events on 0 branches`, with every branch grey, instead of failing.
+
+### New input checks (`00_prune_and_check_orf.py`)
+Every check writes `results_00/<GENE>/00_<GENE>.input_validation.log`, on success
+as well as on failure, so a batch run leaves a readable trail per gene.
+
+| condition | behaviour |
+|---|---|
+| duplicate FASTA names | **halt**, names listed with counts |
+| duplicate or unlabelled tree tips | **halt**, names listed with counts |
+| empty tree file | **halt**, distinguished from an unparseable one |
+| unparseable Newick | **halt**, quotes the parser's own error and the first 200 bytes |
+| amino-acid FASTA | **halt**, reports each sequence's ACGTUN fraction |
+| zero species overlap | **halt**, shows both counts and example names from each side |
+| under 50% species overlap | **warn and continue** on the shared subset |
+| all-complete / all-incomplete ORFs | recorded as a `[NOTE]` |
+
+The amino-acid case mattered more than it looks: `clean_seq()` keeps only
+`ACGTN-`, so a protein FASTA was previously shredded into short nonsense and
+analysed as though it were a CDS, with no error anywhere.
+
+### `--dated yes` on a tree with no branch lengths
+Asking for a dated figure when the tree is a cladogram is a harmless mistake, not
+a reason to fail or to draw a meaningless time axis. `run_one_gene_00_to_04.sh`
+now switches to `--dated no`, prints a `[NOTICE]`, and records it in
+`logs/<GENE>.run_notices.log`. Verified it does **not** fire on a tree that does
+carry branch lengths.
+
+### Tests
+- `tests/input_validation_test.py` -- 19 checks, step 00 only, no MACSE or codeml.
+- `tests/empty_events_and_dated_test.sh` -- 9 checks covering both zero-row
+  crashes and the branch-length detection.
+- Both are self-contained (synthetic sequences and trees in a temp directory) and
+  both were verified to **fail against the pre-fix code**: 13 failures and a
+  non-zero exit respectively.
+- Added to the `Makefile` `test` target. Full suite of nine passes.
+
+### Also verified end to end
+A 106-species all-complete-ORF gene and an 85-species all-incomplete-ORF gene
+both run `diagnostics -> plot` with exit 0. In the all-incomplete case MACSE
+correctly falls back to the undivided input with default frameshift costs, and
+the functional-shared-indel pre-pass disables itself with an explicit warning
+rather than producing a meaningless verdict.
+
+### VERSION bumped to 5.02.
+
 ## v5.01 - version identity made consistent across every file; supersedes the v5.0 release artefact
 
 v5.0 shipped with an inconsistent version identity. `VERSION` said `5.0`, but

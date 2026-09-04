@@ -4,9 +4,9 @@
 
 Pensieve is a gene-centred workflow for reconstructing **where coding-sequence lesions arose on a rooted species tree**. It combines a frameshift-aware MACSE alignment, PAML `codeml` ancestral nucleotide reconstruction, and its own parsimony-based event/history engine to answer, for any coding gene and any rooted tree of species: *which lineage lost this gene first, is the loss shared or independent, and what exactly broke it (a premature stop, a frameshifting indel, or something ambiguous)?* The result is a fully reconstructed ancestral sequence at every internal node and two pairs of publication-ready figures per gene.
 
-v3.31 made installation/execution portable across local machines and HPC systems (no assumption of Miniforge, mamba, or any site-specific module command); every release since has kept that portability while fixing real bugs found by running Pensieve on real genomes, listed in full in [`CHANGELOG.md`](CHANGELOG.md). The current release is **v5.01** (see `VERSION`).
+v3.31 made installation/execution portable across local machines and HPC systems (no assumption of Miniforge, mamba, or any site-specific module command); every release since has kept that portability while fixing real bugs found by running Pensieve on real genomes, listed in full in [`CHANGELOG.md`](CHANGELOG.md). The current release is **v5.02** (see `VERSION`).
 
-**Recent highlights (v4.3–v5.01):**
+**Recent highlights (v4.3–v5.02):**
 
 - **STOPs and partial codons are found on the alignment's own codon grid (v5.0).** Each sequence is walked in chunks of three alignment columns: an exact `TAA`/`TAG`/`TGA` is masked to `NNN` and recorded as a premature STOP; a codon holding one or two gaps has *only* those gaps filled with `N` (`C-A` → `CNA`, `T--` → `TNN`) so codeml never sees a partial codon; a wholly gapped `---` codon is left alone. Every coordinate is a canonical alignment column, so the raw-sequence STOP scan and the raw→alignment coordinate mapping are **gone** — with them, two real defects (see `CHANGELOG.md` v5.0). `--alignment perform` and `--alignment defined` now share one code path from step 02 onward.
 

@@ -188,7 +188,7 @@ def print_short_help():
 def print_long_help():
     print(textwrap.dedent("""\
     ===========================================================================
-    Pensieve v5.01 - full manual
+    Pensieve v5.02 - full manual
     ===========================================================================
 
     PURPOSE
