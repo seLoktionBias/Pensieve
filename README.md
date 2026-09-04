@@ -84,7 +84,9 @@ Every gene run produces **two pairs** of figures. Below are the two views, from 
 
 Both are written as paired PDF (vector, for publication) and PNG (for quick viewing/embedding) to `final_results/<GENE>/important_output/`.
 
-Each is rendered **twice**: once with every reconstructed event, and once as `<GENE>.pseudogenization_tree.no_inframe.*` / `<GENE>.event_map.no_inframe.*` with in-frame (non-disrupting) indels removed — both the shared-ancestral ones and the lineage-specific ones — leaving only frameshift indels and pseudogenizing events. On a large gene the in-frame indels are typically 45–90% of all events, so the second pair is usually the readable one; the first keeps the complete record.
+Each is rendered **twice**: once with every reconstructed event, and once as `<GENE>.pseudogenization_tree.no_inframe.*` / `<GENE>.event_map.no_inframe.*` with in-frame (non-frameshifting) indels removed — both the shared-ancestral ones and the lineage-specific ones — leaving only frameshift indels and pseudogenizing events.
+
+**The full pair is the primary figure.** An in-frame indel does not shift the reading frame, but it can still add or remove functionally important residues, and lineage-specific ones in particular carry real biological signal — so dropping them discards evidence, not noise. The reduced pair is for a reader who only needs the disrupting history: on a large gene in-frame indels are 45–90% of all events, so it is far sparser.
 
 ## Reference-free design
 
