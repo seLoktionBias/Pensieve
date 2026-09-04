@@ -297,6 +297,33 @@ if step_in_range plot; then
       --alignment-length "$ALN_LEN" \
       --outdir "final_results/$GENE/important_output" --dated "$DATED"
     require_file "final_results/$GENE/important_output/${GENE}.pseudogenization_tree.pdf" plot_pdf
+
+    # v5: a second figure pair carrying ONLY frameshift indels and pseudogenizing
+    # events. Same tree, same ORF history, same alignment axis -- the only
+    # difference is that in-frame (non-disrupting) indels are removed from the
+    # event table first, so the disrupting history reads cleanly.
+    echo "[$(date)] STEP plot: second figure pair without in-frame indels"
+    python "$SCRIPT_DIR/05b_filter_inframe_events.py" \
+      "results_03/$GENE/03_${GENE}.alignment_events.tsv" \
+      "results_03/$GENE/03_${GENE}.alignment_events.no_inframe.tsv"
+    NOINF_DIR="results_03/$GENE/_plot_no_inframe"
+    rm -rf "$NOINF_DIR"; mkdir -p "$NOINF_DIR"
+    Rscript "$SCRIPT_DIR/05_plot_events.R" --gene "$GENE" \
+      --tree "results_03/$GENE/03_${GENE}.pensieve_labelled_dated_tree.nwk" \
+      --events "results_03/$GENE/03_${GENE}.alignment_events.no_inframe.tsv" \
+      --orf-transitions "results_03/$GENE/04_${GENE}.orf_transitions_by_branch.tsv" \
+      --orf-status "results_00/$GENE/00_${GENE}.orf_status.tsv" \
+      --complete-orf-validation "results_02/$GENE/02_${GENE}.complete_orf_alignment_validation.tsv" \
+      --alignment-length "$ALN_LEN" --outdir "$NOINF_DIR" --dated "$DATED"
+    for _b in pseudogenization_tree event_map; do
+      for _x in pdf png; do
+        cp -f "$NOINF_DIR/${GENE}.${_b}.${_x}" \
+              "final_results/$GENE/important_output/${GENE}.${_b}.no_inframe.${_x}"
+      done
+    done
+    cp -f "$NOINF_DIR/${GENE}.plotted_events.tsv" \
+          "final_results/$GENE/important_output/${GENE}.plotted_events.no_inframe.tsv"
+    require_file "final_results/$GENE/important_output/${GENE}.pseudogenization_tree.no_inframe.pdf" plot_pdf_no_inframe
   fi
 fi
 
